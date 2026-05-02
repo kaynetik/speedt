@@ -1,0 +1,23 @@
+- id: commit-message-conventional
+  scope: "**"
+  level: warn
+  description: |
+    Use Conventional Commits for individual commits and for the
+    integration messages `plan_integrate` ultimately lands on a base
+    branch. The shape:
+
+      <type>(<scope>)?: <imperative summary>
+
+    Common types: `feat`, `fix`, `refactor`, `chore`, `docs`, `test`,
+    `perf`, `build`, `ci`. Append `!` (or a `BREAKING CHANGE:` footer)
+    when the change breaks a documented contract -- public API, MCP
+    wire format, CLI flags, persisted schema, or rules-engine
+    behaviour.
+
+    Engine caveat: the rules engine cannot inspect commit messages,
+    diff bodies, or git topology. ProposedAction carries only
+    `{ tool, file_path, project }`. This rule surfaces via
+    `rules_list` as advisory guidance on shell-class invocations; the
+    agent is responsible for honoring the format when it actually
+    composes a commit, plan-step output, or integration message.
+  match: "^(Bash|shell|shell_exec|run_command|run_terminal_cmd)$"
