@@ -6,6 +6,7 @@ use anyhow::Result;
 use tokio::time;
 
 use crate::config;
+use crate::ui::{ProbeKind, UiEvent, UiEventTx};
 
 /// Returns latency samples in microseconds. Each probe is a small HTTP GET
 /// against `__down?bytes=0` that fully reads the response, so the sample
@@ -13,11 +14,15 @@ use crate::config;
 /// request, and read of the (zero-byte) body.
 ///
 /// If `cancel` is set, the measurement stops at the next probe boundary.
+/// If `tx` is `Some`, each successful probe is fanned out as a
+/// [`UiEvent::LatencyProbe`] tagged with `kind`.
 pub async fn measure(
     client: &reqwest::Client,
     probes: u32,
     spacing: Duration,
     cancel: Option<Arc<AtomicBool>>,
+    tx: Option<&UiEventTx>,
+    kind: ProbeKind,
 ) -> Result<Vec<u64>> {
     let url = config::download_url(config::LATENCY_BYTES);
     let mut samples = Vec::with_capacity(probes as usize);
@@ -33,7 +38,11 @@ pub async fn measure(
         match client.get(&url).send().await {
             Ok(resp) => {
                 let _ = resp.bytes().await;
-                samples.push(t.elapsed().as_micros() as u64);
+                let rtt_us = t.elapsed().as_micros() as u64;
+                samples.push(rtt_us);
+                if let Some(tx) = tx {
+                    let _ = tx.send(UiEvent::LatencyProbe { kind, rtt_us });
+                }
             }
             Err(_) => continue,
         }

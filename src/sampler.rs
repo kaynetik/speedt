@@ -6,6 +6,8 @@ use serde::Serialize;
 use tokio::task::JoinHandle;
 use tokio::time;
 
+use crate::ui::{UiEvent, UiEventTx};
+
 /// One throughput sample on the timeline.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Sample {
@@ -27,7 +29,7 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    pub fn start(interval_ms: u64) -> Self {
+    pub fn start(interval_ms: u64, tx: Option<UiEventTx>) -> Self {
         let bytes = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let bytes_c = bytes.clone();
@@ -55,11 +57,15 @@ impl Sampler {
                 } else {
                     0.0
                 };
-                samples.push(Sample {
+                let sample = Sample {
                     t_secs: now.duration_since(started_at).as_secs_f64(),
                     mbps,
                     cumulative_bytes: cur,
-                });
+                };
+                samples.push(sample);
+                if let Some(tx) = &tx {
+                    let _ = tx.send(UiEvent::Throughput(sample));
+                }
                 last_bytes = cur;
                 last_at = now;
             }

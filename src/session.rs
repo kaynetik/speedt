@@ -9,7 +9,7 @@ use crate::cli::{DeepOpts, LatencyOpts, QuickOpts};
 use crate::report::{LatencyReport, PhaseReport, SessionReport};
 use crate::sampler::{Sample, Sampler};
 use crate::stats::{BufferbloatGrade, LatencySummary, Summary, bytes_to_mbps};
-use crate::ui::PhaseKind;
+use crate::ui::{PhaseKind, ProbeKind, UiEvent, UiEventTx};
 use crate::{download, latency, metadata, report, upload};
 
 const PROBE_SPACING_MS: u64 = 100;
@@ -43,6 +43,7 @@ pub async fn run_latency_only(
     client: &reqwest::Client,
     opts: LatencyOpts,
     json: bool,
+    tx: Option<&UiEventTx>,
 ) -> Result<()> {
     let started_at = chrono::Utc::now();
     let pb = make_spinner(&format!("latency: {} probes", opts.probes));
@@ -52,6 +53,8 @@ pub async fn run_latency_only(
         opts.probes,
         Duration::from_millis(opts.spacing_ms),
         None,
+        tx,
+        ProbeKind::Idle,
     )
     .await?;
     pb.finish_and_clear();
@@ -80,7 +83,12 @@ pub async fn run_latency_only(
     Ok(())
 }
 
-pub async fn run_quick(client: &reqwest::Client, opts: QuickOpts, json: bool) -> Result<()> {
+pub async fn run_quick(
+    client: &reqwest::Client,
+    opts: QuickOpts,
+    json: bool,
+    tx: Option<&UiEventTx>,
+) -> Result<()> {
     let started_at = chrono::Utc::now();
     let md = metadata::fetch(client).await?;
 
@@ -90,6 +98,8 @@ pub async fn run_quick(client: &reqwest::Client, opts: QuickOpts, json: bool) ->
         opts.latency_probes,
         Duration::from_millis(PROBE_SPACING_MS),
         None,
+        tx,
+        ProbeKind::Idle,
     )
     .await?;
     pb.finish_and_clear();
@@ -103,6 +113,7 @@ pub async fn run_quick(client: &reqwest::Client, opts: QuickOpts, json: bool) ->
         opts.streams,
         100,
         PhaseKind::Download,
+        tx,
     )
     .await?;
     pb.finish_and_clear();
@@ -118,6 +129,7 @@ pub async fn run_quick(client: &reqwest::Client, opts: QuickOpts, json: bool) ->
             opts.streams,
             100,
             PhaseKind::Upload,
+            tx,
         )
         .await?;
         pb.finish_and_clear();
@@ -148,7 +160,12 @@ pub async fn run_quick(client: &reqwest::Client, opts: QuickOpts, json: bool) ->
     Ok(())
 }
 
-pub async fn run_deep(client: &reqwest::Client, opts: DeepOpts, json: bool) -> Result<()> {
+pub async fn run_deep(
+    client: &reqwest::Client,
+    opts: DeepOpts,
+    json: bool,
+    tx: Option<&UiEventTx>,
+) -> Result<()> {
     let started_at = chrono::Utc::now();
     let md = metadata::fetch(client).await?;
 
@@ -171,6 +188,8 @@ pub async fn run_deep(client: &reqwest::Client, opts: DeepOpts, json: bool) -> R
         probes_per_idle,
         Duration::from_millis(PROBE_SPACING_MS),
         None,
+        tx,
+        ProbeKind::Idle,
     )
     .await?;
     pb.finish_and_clear();
@@ -189,6 +208,7 @@ pub async fn run_deep(client: &reqwest::Client, opts: DeepOpts, json: bool) -> R
         opts.sample_ms,
         PhaseKind::Download,
         !opts.no_bufferbloat,
+        tx,
     )
     .await?;
     pb.finish_and_clear();
@@ -210,6 +230,7 @@ pub async fn run_deep(client: &reqwest::Client, opts: DeepOpts, json: bool) -> R
             opts.sample_ms,
             PhaseKind::Upload,
             !opts.no_bufferbloat,
+            tx,
         )
         .await?;
         pb.finish_and_clear();
@@ -222,6 +243,8 @@ pub async fn run_deep(client: &reqwest::Client, opts: DeepOpts, json: bool) -> R
         probes_per_idle,
         Duration::from_millis(PROBE_SPACING_MS),
         None,
+        tx,
+        ProbeKind::Idle,
     )
     .await?;
     pb.finish_and_clear();
@@ -285,8 +308,9 @@ async fn run_phase(
     streams: usize,
     sample_ms: u64,
     kind: PhaseKind,
+    tx: Option<&UiEventTx>,
 ) -> Result<PhaseReport> {
-    let sampler = Sampler::start(sample_ms);
+    let sampler = Sampler::start(sample_ms, tx.cloned());
     let counter = sampler.counter();
     let (total_bytes, requests, errors) = match kind {
         PhaseKind::Download => download::run(client, counter, duration, streams).await?,
@@ -304,8 +328,9 @@ async fn run_phase_with_loaded_latency(
     sample_ms: u64,
     kind: PhaseKind,
     measure_loaded: bool,
+    tx: Option<&UiEventTx>,
 ) -> Result<(PhaseReport, Vec<u64>)> {
-    let sampler = Sampler::start(sample_ms);
+    let sampler = Sampler::start(sample_ms, tx.cloned());
     let counter = sampler.counter();
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -316,6 +341,11 @@ async fn run_phase_with_loaded_latency(
     let loaded_handle = if measure_loaded {
         let probe_client = client.clone();
         let cancel_c = cancel.clone();
+        let probe_tx = tx.cloned();
+        let probe_kind = match kind {
+            PhaseKind::Download => ProbeKind::LoadedDownload,
+            PhaseKind::Upload => ProbeKind::LoadedUpload,
+        };
         Some(tokio::spawn(async move {
             // Skip the first 2 seconds to avoid TCP/TLS warmup contamination.
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -329,7 +359,11 @@ async fn run_phase_with_loaded_latency(
                 let url = crate::config::download_url(crate::config::LATENCY_BYTES);
                 if let Ok(resp) = probe_client.get(url).send().await {
                     let _ = resp.bytes().await;
-                    samples.push(t.elapsed().as_micros() as u64);
+                    let rtt_us = t.elapsed().as_micros() as u64;
+                    samples.push(rtt_us);
+                    if let Some(tx) = &probe_tx {
+                        let _ = tx.send(UiEvent::LatencyProbe { kind: probe_kind, rtt_us });
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }

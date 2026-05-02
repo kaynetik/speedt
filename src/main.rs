@@ -23,9 +23,9 @@ async fn main() -> Result<()> {
     let client = build_client()?;
 
     match cli.command {
-        Command::Quick(opts) => session::run_quick(&client, opts, cli.json).await,
-        Command::Deep(opts) => session::run_deep(&client, opts, cli.json).await,
-        Command::Latency(opts) => session::run_latency_only(&client, opts, cli.json).await,
+        Command::Quick(opts) => session::run_quick(&client, opts, cli.json, None).await,
+        Command::Deep(opts) => session::run_deep(&client, opts, cli.json, None).await,
+        Command::Latency(opts) => session::run_latency_only(&client, opts, cli.json, None).await,
         Command::Info => session::run_info(&client, cli.json).await,
     }
 }
