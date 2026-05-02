@@ -1,0 +1,56 @@
+[package]
+name = "speed-tester"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "fast.com-style internet speed and quality CLI with deep diagnostic mode"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "speedt"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2", "gzip", "json"] }
+futures-util = "0.3"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hdrhistogram = "7"
+indicatif = "0.17"
+comfy-table = "7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+humantime = "2"
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+module_name_repetitions = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+missing_panics_doc = { level = "allow", priority = 1 }
+must_use_candidate = { level = "allow", priority = 1 }
+cast_precision_loss = { level = "allow", priority = 1 }
+cast_possible_truncation = { level = "allow", priority = 1 }
+cast_sign_loss = { level = "allow", priority = 1 }
+uninlined_format_args = { level = "allow", priority = 1 }
+too_many_lines = { level = "allow", priority = 1 }
+similar_names = { level = "allow", priority = 1 }
+doc_markdown = { level = "allow", priority = 1 }
+single_match_else = { level = "allow", priority = 1 }
+map_unwrap_or = { level = "allow", priority = 1 }
