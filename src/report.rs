@@ -5,7 +5,7 @@ use crate::metadata::Metadata;
 use crate::sampler::Sample;
 use crate::stats::{BufferbloatGrade, LatencySummary, Summary};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PhaseReport {
     pub label: &'static str,
     pub duration_secs: f64,
@@ -20,7 +20,7 @@ pub struct PhaseReport {
     pub time_to_saturation_secs: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LatencyReport {
     pub idle: Option<LatencySummary>,
     pub loaded_download: Option<LatencySummary>,
@@ -29,7 +29,7 @@ pub struct LatencyReport {
     pub bufferbloat_upload: Option<BufferbloatGrade>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionReport {
     pub mode: &'static str,
     pub started_at: chrono::DateTime<chrono::Utc>,

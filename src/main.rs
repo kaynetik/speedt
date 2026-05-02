@@ -8,6 +8,7 @@ mod upload;
 mod stats;
 mod report;
 mod session;
+mod ui;
 
 use anyhow::Result;
 use clap::Parser;

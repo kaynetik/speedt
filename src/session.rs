@@ -9,6 +9,7 @@ use crate::cli::{DeepOpts, LatencyOpts, QuickOpts};
 use crate::report::{LatencyReport, PhaseReport, SessionReport};
 use crate::sampler::{Sample, Sampler};
 use crate::stats::{BufferbloatGrade, LatencySummary, Summary, bytes_to_mbps};
+use crate::ui::PhaseKind;
 use crate::{download, latency, metadata, report, upload};
 
 const PROBE_SPACING_MS: u64 = 100;
@@ -275,12 +276,6 @@ pub async fn run_deep(client: &reqwest::Client, opts: DeepOpts, json: bool) -> R
         report::print_human(&rep);
     }
     Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum PhaseKind {
-    Download,
-    Upload,
 }
 
 async fn run_phase(
