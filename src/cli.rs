@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,6 +20,50 @@ pub struct Cli {
     /// Emit a single JSON document instead of a human report
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// UI mode: `auto` picks `tui` when stdout+stderr are TTYs, else `plain`.
+    /// `--json` always forces `plain`.
+    #[arg(long, value_enum, default_value_t = UiMode::Auto, global = true)]
+    pub ui: UiMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum UiMode {
+    /// Pick `tui` if stdout and stderr are both TTYs, otherwise `plain`.
+    Auto,
+    /// Force the live terminal UI.
+    Tui,
+    /// Plain line-oriented output suitable for pipes and logs.
+    Plain,
+}
+
+/// Concrete UI mode after resolving `auto` and `--json` overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedUiMode {
+    Tui,
+    Plain,
+}
+
+impl Cli {
+    /// Resolve the effective UI mode. `--json` forces `Plain`; `Auto` becomes
+    /// `Tui` only when both stdout and stderr are attached to a terminal.
+    pub fn resolved_ui(&self) -> ResolvedUiMode {
+        if self.json {
+            return ResolvedUiMode::Plain;
+        }
+        match self.ui {
+            UiMode::Tui => ResolvedUiMode::Tui,
+            UiMode::Plain => ResolvedUiMode::Plain,
+            UiMode::Auto => {
+                use is_terminal::IsTerminal;
+                if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
+                    ResolvedUiMode::Tui
+                } else {
+                    ResolvedUiMode::Plain
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
