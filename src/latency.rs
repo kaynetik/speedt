@@ -1,8 +1,7 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use tokio::sync::watch;
 use tokio::time;
 
 use crate::config;
@@ -13,14 +12,14 @@ use crate::ui::{ProbeKind, UiEvent, UiEventTx};
 /// captures the full RTT including TLS negotiation reuse, write of the
 /// request, and read of the (zero-byte) body.
 ///
-/// If `cancel` is set, the measurement stops at the next probe boundary.
-/// If `tx` is `Some`, each successful probe is fanned out as a
-/// [`UiEvent::LatencyProbe`] tagged with `kind`.
+/// If `cancel` is set and flips to `true`, the measurement stops at the
+/// next probe boundary. If `tx` is `Some`, each successful probe is fanned
+/// out as a [`UiEvent::LatencyProbe`] tagged with `kind`.
 pub async fn measure(
     client: &reqwest::Client,
     probes: u32,
     spacing: Duration,
-    cancel: Option<Arc<AtomicBool>>,
+    cancel: Option<watch::Receiver<bool>>,
     tx: Option<&UiEventTx>,
     kind: ProbeKind,
 ) -> Result<Vec<u64>> {
@@ -29,9 +28,7 @@ pub async fn measure(
     let mut ticker = time::interval(spacing);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     for _ in 0..probes {
-        if let Some(c) = &cancel
-            && c.load(Ordering::Relaxed)
-        {
+        if cancelled(cancel.as_ref()) {
             break;
         }
         let t = Instant::now();
@@ -49,4 +46,8 @@ pub async fn measure(
         ticker.tick().await;
     }
     Ok(samples)
+}
+
+fn cancelled(cancel: Option<&watch::Receiver<bool>>) -> bool {
+    cancel.is_some_and(|c| *c.borrow())
 }

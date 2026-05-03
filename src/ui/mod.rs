@@ -27,6 +27,7 @@ pub enum UiEvent {
         mode: &'static str,
         total_planned_secs: f64,
         metadata: Box<Metadata>,
+        started_at: chrono::DateTime<chrono::Utc>,
     },
     PhaseStarted {
         kind: PhaseKind,

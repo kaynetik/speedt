@@ -34,9 +34,11 @@ async fn main() -> Result<()> {
 
 async fn run_plain(client: &reqwest::Client, cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Quick(opts) => session::run_quick(client, opts, cli.json, None).await,
-        Command::Deep(opts) => session::run_deep(client, opts, cli.json, None).await,
-        Command::Latency(opts) => session::run_latency_only(client, opts, cli.json, None).await,
+        Command::Quick(opts) => session::run_quick(client, opts, cli.json, None, None).await,
+        Command::Deep(opts) => session::run_deep(client, opts, cli.json, None, None).await,
+        Command::Latency(opts) => {
+            session::run_latency_only(client, opts, cli.json, None, None).await
+        }
         Command::Info => session::run_info(client, cli.json).await,
     }
 }
@@ -48,16 +50,24 @@ async fn run_with_tui(client: &reqwest::Client, cli: Cli) -> Result<()> {
     }
 
     let (tx, rx) = tokio::sync::broadcast::channel::<ui::UiEvent>(UI_BUS_CAPACITY);
-    let tui = tokio::spawn(ui::tui::run(rx));
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let tui = tokio::spawn(ui::tui::run(rx, cancel_tx));
 
     let session_result = match cli.command {
-        Command::Quick(opts) => session::run_quick(client, opts, cli.json, Some(&tx)).await,
-        Command::Deep(opts) => session::run_deep(client, opts, cli.json, Some(&tx)).await,
-        Command::Latency(opts) => session::run_latency_only(client, opts, cli.json, Some(&tx)).await,
+        Command::Quick(opts) => {
+            session::run_quick(client, opts, cli.json, Some(&tx), Some(cancel_rx)).await
+        }
+        Command::Deep(opts) => {
+            session::run_deep(client, opts, cli.json, Some(&tx), Some(cancel_rx)).await
+        }
+        Command::Latency(opts) => {
+            session::run_latency_only(client, opts, cli.json, Some(&tx), Some(cancel_rx)).await
+        }
         Command::Info => unreachable!("handled above"),
     };
 
-    // Closing the bus signals the TUI to drain and exit.
+    // Closing the bus signals the TUI to drain and exit (if the user hasn't
+    // already pressed `q`, in which case the TUI is already gone).
     drop(tx);
     let _ = tui.await;
     session_result

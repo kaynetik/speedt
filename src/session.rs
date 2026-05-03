@@ -1,9 +1,10 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
+use tokio::sync::watch;
 
 use crate::cli::{DeepOpts, LatencyOpts, QuickOpts};
 use crate::report::{LatencyReport, PhaseReport, SessionReport};
@@ -44,6 +45,7 @@ pub async fn run_latency_only(
     opts: LatencyOpts,
     json: bool,
     tx: Option<&UiEventTx>,
+    cancel: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     let started_at = chrono::Utc::now();
     let pb = make_spinner(&format!("latency: {} probes", opts.probes));
@@ -55,27 +57,32 @@ pub async fn run_latency_only(
             mode: "latency",
             total_planned_secs,
             metadata: Box::new(md.clone()),
+            started_at,
         });
     }
     let samples = latency::measure(
         client,
         opts.probes,
         Duration::from_millis(opts.spacing_ms),
-        None,
+        cancel.clone(),
         tx,
         ProbeKind::Idle,
     )
     .await?;
     pb.finish_and_clear();
 
-    let idle = LatencySummary::from_micros(&samples);
+    let idle = if samples.is_empty() {
+        None
+    } else {
+        Some(LatencySummary::from_micros(&samples))
+    };
     let rep = SessionReport {
         mode: "latency",
         started_at,
         ended_at: chrono::Utc::now(),
         metadata: md,
         latency: LatencyReport {
-            idle: Some(idle),
+            idle,
             loaded_download: None,
             loaded_upload: None,
             bufferbloat_download: None,
@@ -100,6 +107,7 @@ pub async fn run_quick(
     opts: QuickOpts,
     json: bool,
     tx: Option<&UiEventTx>,
+    cancel: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     let started_at = chrono::Utc::now();
     let md = metadata::fetch(client).await?;
@@ -113,6 +121,7 @@ pub async fn run_quick(
             mode: "quick",
             total_planned_secs: idle_planned_secs + dl_planned_secs + ul_planned_secs,
             metadata: Box::new(md.clone()),
+            started_at,
         });
     }
 
@@ -121,28 +130,38 @@ pub async fn run_quick(
         client,
         opts.latency_probes,
         Duration::from_millis(PROBE_SPACING_MS),
-        None,
+        cancel.clone(),
         tx,
         ProbeKind::Idle,
     )
     .await?;
     pb.finish_and_clear();
-    let idle = LatencySummary::from_micros(&idle_samples);
+    let idle = if idle_samples.is_empty() {
+        None
+    } else {
+        Some(LatencySummary::from_micros(&idle_samples))
+    };
 
-    let pb = make_spinner(&format!("download {}s @ {} streams", opts.download_secs, opts.streams));
-    let download = run_phase(
-        client,
-        "download",
-        Duration::from_secs(opts.download_secs),
-        opts.streams,
-        100,
-        PhaseKind::Download,
-        tx,
-    )
-    .await?;
-    pb.finish_and_clear();
+    let download = if cancelled(cancel.as_ref()) {
+        None
+    } else {
+        let pb = make_spinner(&format!("download {}s @ {} streams", opts.download_secs, opts.streams));
+        let r = run_phase(
+            client,
+            "download",
+            Duration::from_secs(opts.download_secs),
+            opts.streams,
+            100,
+            PhaseKind::Download,
+            tx,
+            cancel.clone(),
+        )
+        .await?;
+        pb.finish_and_clear();
+        r
+    };
 
-    let upload = if opts.no_upload {
+    let upload = if opts.no_upload || cancelled(cancel.as_ref()) {
         None
     } else {
         let pb = make_spinner(&format!("upload {}s @ {} streams", opts.upload_secs, opts.streams));
@@ -154,10 +173,11 @@ pub async fn run_quick(
             100,
             PhaseKind::Upload,
             tx,
+            cancel.clone(),
         )
         .await?;
         pb.finish_and_clear();
-        Some(r)
+        r
     };
 
     let rep = SessionReport {
@@ -166,13 +186,13 @@ pub async fn run_quick(
         ended_at: chrono::Utc::now(),
         metadata: md,
         latency: LatencyReport {
-            idle: Some(idle),
+            idle,
             loaded_download: None,
             loaded_upload: None,
             bufferbloat_download: None,
             bufferbloat_upload: None,
         },
-        download: Some(download),
+        download,
         upload,
     };
 
@@ -193,6 +213,7 @@ pub async fn run_deep(
     opts: DeepOpts,
     json: bool,
     tx: Option<&UiEventTx>,
+    cancel: Option<watch::Receiver<bool>>,
 ) -> Result<()> {
     let started_at = chrono::Utc::now();
     let md = metadata::fetch(client).await?;
@@ -215,6 +236,7 @@ pub async fn run_deep(
             mode: "deep",
             total_planned_secs: total.as_secs_f64(),
             metadata: Box::new(md.clone()),
+            started_at,
         });
     }
 
@@ -223,33 +245,39 @@ pub async fn run_deep(
         client,
         probes_per_idle,
         Duration::from_millis(PROBE_SPACING_MS),
-        None,
+        cancel.clone(),
         tx,
         ProbeKind::Idle,
     )
     .await?;
     pb.finish_and_clear();
 
-    let pb = make_spinner(&format!(
-        "download {:.0}s @ {} streams (sampling every {}ms)",
-        dl_dur.as_secs_f64(),
-        opts.streams,
-        opts.sample_ms
-    ));
-    let (download, loaded_dl_samples) = run_phase_with_loaded_latency(
-        client,
-        "download",
-        dl_dur,
-        opts.streams,
-        opts.sample_ms,
-        PhaseKind::Download,
-        !opts.no_bufferbloat,
-        tx,
-    )
-    .await?;
-    pb.finish_and_clear();
+    let (download, loaded_dl_samples) = if cancelled(cancel.as_ref()) {
+        (None, Vec::new())
+    } else {
+        let pb = make_spinner(&format!(
+            "download {:.0}s @ {} streams (sampling every {}ms)",
+            dl_dur.as_secs_f64(),
+            opts.streams,
+            opts.sample_ms
+        ));
+        let (p, s) = run_phase_with_loaded_latency(
+            client,
+            "download",
+            dl_dur,
+            opts.streams,
+            opts.sample_ms,
+            PhaseKind::Download,
+            !opts.no_bufferbloat,
+            tx,
+            cancel.clone(),
+        )
+        .await?;
+        pb.finish_and_clear();
+        (p, s)
+    };
 
-    let (upload, loaded_ul_samples) = if opts.no_upload {
+    let (upload, loaded_ul_samples) = if opts.no_upload || cancelled(cancel.as_ref()) {
         (None, Vec::new())
     } else {
         let pb = make_spinner(&format!(
@@ -267,27 +295,37 @@ pub async fn run_deep(
             PhaseKind::Upload,
             !opts.no_bufferbloat,
             tx,
+            cancel.clone(),
         )
         .await?;
         pb.finish_and_clear();
-        (Some(p), s)
+        (p, s)
     };
 
-    let pb = make_spinner(&format!("idle latency (end, ~{}s)", idle_each.as_secs()));
-    let idle_end = latency::measure(
-        client,
-        probes_per_idle,
-        Duration::from_millis(PROBE_SPACING_MS),
-        None,
-        tx,
-        ProbeKind::Idle,
-    )
-    .await?;
-    pb.finish_and_clear();
+    let idle_end = if cancelled(cancel.as_ref()) {
+        Vec::new()
+    } else {
+        let pb = make_spinner(&format!("idle latency (end, ~{}s)", idle_each.as_secs()));
+        let r = latency::measure(
+            client,
+            probes_per_idle,
+            Duration::from_millis(PROBE_SPACING_MS),
+            cancel.clone(),
+            tx,
+            ProbeKind::Idle,
+        )
+        .await?;
+        pb.finish_and_clear();
+        r
+    };
 
     let mut idle_all = idle_start;
     idle_all.extend(idle_end);
-    let idle = LatencySummary::from_micros(&idle_all);
+    let idle = if idle_all.is_empty() {
+        None
+    } else {
+        Some(LatencySummary::from_micros(&idle_all))
+    };
 
     let loaded_dl = if loaded_dl_samples.is_empty() {
         None
@@ -300,15 +338,15 @@ pub async fn run_deep(
         Some(LatencySummary::from_micros(&loaded_ul_samples))
     };
 
-    let bb_dl = match (&loaded_dl, idle.p50_ms) {
-        (Some(l), idle_p50) if idle_p50 > 0.0 => {
-            Some(BufferbloatGrade::from_added((l.p50_ms - idle_p50).max(0.0)))
+    let bb_dl = match (idle.as_ref(), loaded_dl.as_ref()) {
+        (Some(i), Some(l)) if i.p50_ms > 0.0 => {
+            Some(BufferbloatGrade::from_added((l.p50_ms - i.p50_ms).max(0.0)))
         }
         _ => None,
     };
-    let bb_ul = match (&loaded_ul, idle.p50_ms) {
-        (Some(l), idle_p50) if idle_p50 > 0.0 => {
-            Some(BufferbloatGrade::from_added((l.p50_ms - idle_p50).max(0.0)))
+    let bb_ul = match (idle.as_ref(), loaded_ul.as_ref()) {
+        (Some(i), Some(l)) if i.p50_ms > 0.0 => {
+            Some(BufferbloatGrade::from_added((l.p50_ms - i.p50_ms).max(0.0)))
         }
         _ => None,
     };
@@ -319,13 +357,13 @@ pub async fn run_deep(
         ended_at: chrono::Utc::now(),
         metadata: md,
         latency: LatencyReport {
-            idle: Some(idle),
+            idle,
             loaded_download: loaded_dl,
             loaded_upload: loaded_ul,
             bufferbloat_download: bb_dl,
             bufferbloat_upload: bb_ul,
         },
-        download: Some(download),
+        download,
         upload,
     };
 
@@ -341,6 +379,10 @@ pub async fn run_deep(
     Ok(())
 }
 
+/// Run a throughput phase. Returns `Some(report)` when the phase completed
+/// (or its deadline elapsed). Returns `None` only if the user cancelled
+/// before any work happened, so the caller can omit the phase from the
+/// session report rather than emit a near-empty placeholder.
 async fn run_phase(
     client: &reqwest::Client,
     label: &'static str,
@@ -349,7 +391,11 @@ async fn run_phase(
     sample_ms: u64,
     kind: PhaseKind,
     tx: Option<&UiEventTx>,
-) -> Result<PhaseReport> {
+    cancel: Option<watch::Receiver<bool>>,
+) -> Result<Option<PhaseReport>> {
+    if cancelled(cancel.as_ref()) {
+        return Ok(None);
+    }
     if let Some(tx) = tx {
         let _ = tx.send(UiEvent::PhaseStarted {
             kind,
@@ -359,16 +405,27 @@ async fn run_phase(
     }
     let sampler = Sampler::start(sample_ms, tx.cloned());
     let counter = sampler.counter();
-    let (total_bytes, requests, errors) = match kind {
-        PhaseKind::Download => download::run(client, counter, duration, streams).await?,
-        PhaseKind::Upload => upload::run(client, counter, duration, streams).await?,
+
+    let phase_fut = async {
+        match kind {
+            PhaseKind::Download => download::run(client, counter, duration, streams).await,
+            PhaseKind::Upload => upload::run(client, counter, duration, streams).await,
+        }
     };
-    let (timeline, _final_bytes, elapsed) = sampler.stop().await;
+
+    let outcome = race_with_cancel(phase_fut, cancel.clone()).await;
+    let (timeline, final_bytes, elapsed) = sampler.stop().await;
+
+    let (total_bytes, requests, errors) = match outcome {
+        Some(res) => res?,
+        None => (final_bytes, 0, 0),
+    };
+
     let report = build_phase_report(label, total_bytes, requests, errors, elapsed, timeline);
     if let Some(tx) = tx {
         let _ = tx.send(UiEvent::PhaseFinished(report.clone()));
     }
-    Ok(report)
+    Ok(Some(report))
 }
 
 async fn run_phase_with_loaded_latency(
@@ -380,7 +437,11 @@ async fn run_phase_with_loaded_latency(
     kind: PhaseKind,
     measure_loaded: bool,
     tx: Option<&UiEventTx>,
-) -> Result<(PhaseReport, Vec<u64>)> {
+    cancel: Option<watch::Receiver<bool>>,
+) -> Result<(Option<PhaseReport>, Vec<u64>)> {
+    if cancelled(cancel.as_ref()) {
+        return Ok((None, Vec::new()));
+    }
     if let Some(tx) = tx {
         let _ = tx.send(UiEvent::PhaseStarted {
             kind,
@@ -391,14 +452,14 @@ async fn run_phase_with_loaded_latency(
     let sampler = Sampler::start(sample_ms, tx.cloned());
     let counter = sampler.counter();
 
-    let cancel = Arc::new(AtomicBool::new(false));
+    let probe_stop = Arc::new(AtomicBool::new(false));
 
     // Spawn loaded-latency probe in the background; it runs against the same
     // server using a separate connection so it sees the queue depth that
     // bulk transfers create.
     let loaded_handle = if measure_loaded {
         let probe_client = client.clone();
-        let cancel_c = cancel.clone();
+        let stop = probe_stop.clone();
         let probe_tx = tx.cloned();
         let probe_kind = match kind {
             PhaseKind::Download => ProbeKind::LoadedDownload,
@@ -411,7 +472,7 @@ async fn run_phase_with_loaded_latency(
             let stop_at = std::time::Instant::now()
                 + duration.saturating_sub(Duration::from_secs(3));
             while std::time::Instant::now() < stop_at
-                && !cancel_c.load(std::sync::atomic::Ordering::Relaxed)
+                && !stop.load(Ordering::Relaxed)
             {
                 let t = std::time::Instant::now();
                 let url = crate::config::download_url(crate::config::LATENCY_BYTES);
@@ -431,23 +492,58 @@ async fn run_phase_with_loaded_latency(
         None
     };
 
-    let (total_bytes, requests, errors) = match kind {
-        PhaseKind::Download => download::run(client, counter, duration, streams).await?,
-        PhaseKind::Upload => upload::run(client, counter, duration, streams).await?,
+    let phase_fut = async {
+        match kind {
+            PhaseKind::Download => download::run(client, counter, duration, streams).await,
+            PhaseKind::Upload => upload::run(client, counter, duration, streams).await,
+        }
     };
 
-    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    let (timeline, _final_bytes, elapsed) = sampler.stop().await;
+    let outcome = race_with_cancel(phase_fut, cancel.clone()).await;
+
+    // Always signal the loaded-latency probe to stop, whether the phase
+    // ended naturally or via user cancel.
+    probe_stop.store(true, Ordering::Relaxed);
+
+    let (timeline, final_bytes, elapsed) = sampler.stop().await;
     let loaded = match loaded_handle {
         Some(h) => h.await.unwrap_or_default(),
         None => Vec::new(),
+    };
+
+    let (total_bytes, requests, errors) = match outcome {
+        Some(res) => res?,
+        None => (final_bytes, 0, 0),
     };
 
     let report = build_phase_report(label, total_bytes, requests, errors, elapsed, timeline);
     if let Some(tx) = tx {
         let _ = tx.send(UiEvent::PhaseFinished(report.clone()));
     }
-    Ok((report, loaded))
+    Ok((Some(report), loaded))
+}
+
+/// Race `fut` against the cancel signal. Returns `Some(value)` if `fut`
+/// completed first; `None` if cancel fired (the future is dropped, which
+/// aborts any tasks it owned via `JoinSet`).
+async fn race_with_cancel<F, T>(fut: F, cancel: Option<watch::Receiver<bool>>) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match cancel {
+        Some(mut c) => {
+            tokio::select! {
+                biased;
+                _ = c.wait_for(|v| *v) => None,
+                v = fut => Some(v),
+            }
+        }
+        None => Some(fut.await),
+    }
+}
+
+fn cancelled(cancel: Option<&watch::Receiver<bool>>) -> bool {
+    cancel.is_some_and(|c| *c.borrow())
 }
 
 fn build_phase_report(

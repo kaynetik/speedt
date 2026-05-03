@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -16,24 +17,32 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::watch;
 use tokio::time;
 
 use super::{PhaseKind, ProbeKind, UiEvent, UiEventRx};
 use crate::metadata::Metadata;
-use crate::report::PhaseReport;
+use crate::report::{LatencyReport, PhaseReport, SessionReport};
 use crate::sampler::Sample;
-use crate::stats::BufferbloatGrade;
+use crate::stats::{BufferbloatGrade, LatencySummary};
 
 /// 240 samples = 24 s of timeline at the engine's 100 ms sampling cadence.
 const SAMPLE_BUFFER_CAP: usize = 240;
 /// ~30 fps: short enough to feel live, slow enough to be cheap.
 const RENDER_INTERVAL: Duration = Duration::from_millis(33);
+/// How long the "saved to …" footer flash stays visible after pressing `s`.
+const SAVE_FLASH: Duration = Duration::from_secs(4);
 
 /// Run the live TUI until the event channel closes, the user quits, or the
 /// crossterm input stream ends. The terminal is restored on every exit path.
-pub async fn run(mut rx: UiEventRx) -> Result<()> {
+///
+/// The TUI owns the `cancel_tx` side of a watch channel shared with the
+/// engine session: pressing `q` flips it to `true`, prompting download /
+/// upload / latency tasks to wind down promptly so the partial
+/// `SessionReport` can still be printed.
+pub async fn run(mut rx: UiEventRx, cancel_tx: watch::Sender<bool>) -> Result<()> {
     let mut terminal = enter()?;
-    let result = run_loop(&mut terminal, &mut rx).await;
+    let result = run_loop(&mut terminal, &mut rx, &cancel_tx).await;
     leave(&mut terminal);
     result
 }
@@ -55,6 +64,7 @@ fn leave(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     rx: &mut UiEventRx,
+    cancel_tx: &watch::Sender<bool>,
 ) -> Result<()> {
     let mut input = EventStream::new();
     let mut tick = time::interval(RENDER_INTERVAL);
@@ -70,7 +80,20 @@ async fn run_loop(
                 Err(RecvError::Lagged(_)) => {}
             },
             key = input.next() => match key {
-                Some(Ok(Event::Key(k))) if is_quit(k) => break,
+                Some(Ok(Event::Key(k))) => match key_action(k) {
+                    Some(KeyAction::Quit) => {
+                        // Signal cancel and exit the loop. Restoring the
+                        // terminal here lets the engine's partial-report
+                        // printout land on a sane terminal afterwards.
+                        let _ = cancel_tx.send(true);
+                        break;
+                    }
+                    Some(KeyAction::Save) => {
+                        let result = save_report(&state);
+                        state.last_save = Some(SaveStatus { at: Instant::now(), result });
+                    }
+                    None => {}
+                },
                 Some(Ok(_) | Err(_)) => {}
                 None => break,
             },
@@ -82,9 +105,18 @@ async fn run_loop(
     Ok(())
 }
 
-fn is_quit(k: KeyEvent) -> bool {
-    matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-        || (matches!(k.code, KeyCode::Char('c')) && k.modifiers.contains(KeyModifiers::CONTROL))
+#[derive(Debug, Clone, Copy)]
+enum KeyAction {
+    Quit,
+    Save,
+}
+
+fn key_action(k: KeyEvent) -> Option<KeyAction> {
+    match k.code {
+        KeyCode::Char('q') => Some(KeyAction::Quit),
+        KeyCode::Char('s') => Some(KeyAction::Save),
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -92,6 +124,9 @@ struct State {
     mode: Option<&'static str>,
     metadata: Option<Box<Metadata>>,
     session_started_at: Option<Instant>,
+    /// Wall-clock start time, captured from `UiEvent::SessionStarted`. Used
+    /// by `s` (save report) so the saved JSON matches the `--json` shape.
+    session_started_at_utc: Option<chrono::DateTime<chrono::Utc>>,
     total_planned_secs: f64,
 
     active: Option<ActivePhase>,
@@ -102,6 +137,12 @@ struct State {
     loaded_ul_rtts_us: Vec<u64>,
 
     last_error: Option<String>,
+    last_save: Option<SaveStatus>,
+}
+
+struct SaveStatus {
+    at: Instant,
+    result: std::result::Result<PathBuf, String>,
 }
 
 struct ActivePhase {
@@ -132,10 +173,11 @@ impl ActivePhase {
 impl State {
     fn apply(&mut self, ev: UiEvent) {
         match ev {
-            UiEvent::SessionStarted { mode, total_planned_secs, metadata } => {
+            UiEvent::SessionStarted { mode, total_planned_secs, metadata, started_at } => {
                 self.mode = Some(mode);
                 self.metadata = Some(metadata);
                 self.session_started_at = Some(Instant::now());
+                self.session_started_at_utc = Some(started_at);
                 self.total_planned_secs = total_planned_secs;
             }
             UiEvent::PhaseStarted { kind, label, planned_secs } => {
@@ -477,22 +519,115 @@ fn bufferbloat(idle_p50: Option<f64>, loaded_p50: Option<f64>) -> Option<Bufferb
 }
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, state: &State) {
-    let line = if let Some(err) = &state.last_error {
-        Line::from(vec![
-            Span::styled("error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Span::raw(err.clone()),
-            Span::raw("    "),
-            Span::styled("q / Esc / Ctrl-C", Style::default().fg(Color::DarkGray)),
-            Span::raw(" quit "),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("q / Esc / Ctrl-C", Style::default().fg(Color::DarkGray)),
-            Span::raw(" quit"),
-        ])
-    };
-    let para = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if let Some(err) = &state.last_error {
+        spans.push(Span::styled(
+            "error: ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(err.clone()));
+        spans.push(Span::raw("    "));
+    }
+    spans.push(Span::styled("q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    spans.push(Span::styled(" quit", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled("s", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    spans.push(Span::styled(" save report", Style::default().fg(Color::DarkGray)));
+    if let Some(flash) = save_flash_span(state) {
+        spans.push(Span::raw("    "));
+        spans.push(flash);
+    }
+    let para = Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL));
     f.render_widget(para, area);
+}
+
+fn save_flash_span(state: &State) -> Option<Span<'static>> {
+    let s = state.last_save.as_ref()?;
+    if s.at.elapsed() > SAVE_FLASH {
+        return None;
+    }
+    Some(match &s.result {
+        Ok(path) => Span::styled(
+            format!("saved → {}", path.display()),
+            Style::default().fg(Color::Green),
+        ),
+        Err(msg) => Span::styled(
+            format!("save failed: {msg}"),
+            Style::default().fg(Color::Red),
+        ),
+    })
+}
+
+// ---- save report ----------------------------------------------------------
+
+/// Serialise a best-effort `SessionReport` from whatever the TUI has
+/// observed so far and write it to `./speedt-<UTC-RFC3339>.json`. Partial
+/// (in-flight) phases are intentionally absent rather than synthesised, so
+/// the file matches the `--json` shape without lying about phase numbers.
+fn save_report(state: &State) -> std::result::Result<PathBuf, String> {
+    let rep = build_partial_report(state);
+    let json = serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?;
+    let stamp = chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        .replace(':', "-");
+    let path = PathBuf::from(format!("./speedt-{stamp}.json"));
+    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+fn build_partial_report(state: &State) -> SessionReport {
+    let download = state
+        .finished
+        .iter()
+        .find(|p| p.label == "download")
+        .cloned();
+    let upload = state
+        .finished
+        .iter()
+        .find(|p| p.label == "upload")
+        .cloned();
+
+    let idle = (!state.idle_rtts_us.is_empty())
+        .then(|| LatencySummary::from_micros(&state.idle_rtts_us));
+    let loaded_dl = (!state.loaded_dl_rtts_us.is_empty())
+        .then(|| LatencySummary::from_micros(&state.loaded_dl_rtts_us));
+    let loaded_ul = (!state.loaded_ul_rtts_us.is_empty())
+        .then(|| LatencySummary::from_micros(&state.loaded_ul_rtts_us));
+
+    let bb_dl = match (idle.as_ref(), loaded_dl.as_ref()) {
+        (Some(i), Some(l)) if i.p50_ms > 0.0 => Some(BufferbloatGrade::from_added(
+            (l.p50_ms - i.p50_ms).max(0.0),
+        )),
+        _ => None,
+    };
+    let bb_ul = match (idle.as_ref(), loaded_ul.as_ref()) {
+        (Some(i), Some(l)) if i.p50_ms > 0.0 => Some(BufferbloatGrade::from_added(
+            (l.p50_ms - i.p50_ms).max(0.0),
+        )),
+        _ => None,
+    };
+
+    SessionReport {
+        mode: state.mode.unwrap_or("partial"),
+        started_at: state
+            .session_started_at_utc
+            .unwrap_or_else(chrono::Utc::now),
+        ended_at: chrono::Utc::now(),
+        metadata: state
+            .metadata
+            .as_deref()
+            .cloned()
+            .unwrap_or_default(),
+        latency: LatencyReport {
+            idle,
+            loaded_download: loaded_dl,
+            loaded_upload: loaded_ul,
+            bufferbloat_download: bb_dl,
+            bufferbloat_upload: bb_ul,
+        },
+        download,
+        upload,
+    }
 }
 
 // ---- helpers ---------------------------------------------------------------
