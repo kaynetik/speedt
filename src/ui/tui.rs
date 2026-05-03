@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -33,14 +34,41 @@ const RENDER_INTERVAL: Duration = Duration::from_millis(33);
 /// How long the "saved to …" footer flash stays visible after pressing `s`.
 const SAVE_FLASH: Duration = Duration::from_secs(4);
 
-/// Run the live TUI until the event channel closes, the user quits, or the
-/// crossterm input stream ends. The terminal is restored on every exit path.
+/// Install a process-wide panic hook that restores the terminal (cooked mode,
+/// main screen, visible cursor) before delegating to the previously-installed
+/// hook. Idempotent via `Once`, so calling it again — including from tests
+/// that re-enter the TUI — does not chain the same restore step repeatedly.
+pub fn install_panic_hook() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            prev(info);
+        }));
+    });
+}
+
+/// Best-effort terminal restoration. Used by the panic hook and exposed for
+/// the rare case where a caller has clobbered terminal state and wants to
+/// recover without panicking. Errors are swallowed: there is nothing useful
+/// to do with them at this point and the caller usually cannot recover.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+}
+
+/// Run the live TUI until the event channel closes, the user quits, the
+/// crossterm input stream ends, or `SIGINT` arrives. The terminal is restored
+/// on every exit path; a panic anywhere underneath is also caught by the
+/// hook installed in [`install_panic_hook`].
 ///
 /// The TUI owns the `cancel_tx` side of a watch channel shared with the
 /// engine session: pressing `q` flips it to `true`, prompting download /
 /// upload / latency tasks to wind down promptly so the partial
 /// `SessionReport` can still be printed.
 pub async fn run(mut rx: UiEventRx, cancel_tx: watch::Sender<bool>) -> Result<()> {
+    install_panic_hook();
     let mut terminal = enter()?;
     let result = run_loop(&mut terminal, &mut rx, &cancel_tx).await;
     leave(&mut terminal);
@@ -74,6 +102,13 @@ async fn run_loop(
     loop {
         tokio::select! {
             biased;
+            // SIGINT mirrors `q`: signal cancel and break out so `leave()`
+            // restores the terminal. Process-level exit on SIGINT is also
+            // handled in `main` for the case where the TUI never started.
+            _ = tokio::signal::ctrl_c() => {
+                let _ = cancel_tx.send(true);
+                break;
+            }
             ev = rx.recv() => match ev {
                 Ok(ev) => state.apply(ev),
                 Err(RecvError::Closed) => break,
@@ -722,4 +757,49 @@ fn stable_tail_mean(samples: &[f64]) -> Option<f64> {
         return None;
     }
     Some(sum / n as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The panic hook is process-global, so two tests installing competing hooks
+    // would race. Serialize hook-touching tests behind a mutex.
+    static HOOK_LOCK: Mutex<()> = Mutex::new(());
+    static PREV_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn install_panic_hook_chains_to_previous_and_is_idempotent() {
+        let _guard = HOOK_LOCK.lock().unwrap();
+
+        let original = std::panic::take_hook();
+
+        PREV_CALLS.store(0, Ordering::SeqCst);
+        std::panic::set_hook(Box::new(|_| {
+            PREV_CALLS.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // Once-guarded: second call is a no-op so the chain stays single-step.
+        install_panic_hook();
+        install_panic_hook();
+
+        let result = std::panic::catch_unwind(|| panic!("hook-test"));
+        assert!(result.is_err(), "panic should propagate through catch_unwind");
+        assert_eq!(
+            PREV_CALLS.load(Ordering::SeqCst),
+            1,
+            "previous hook must run exactly once per panic"
+        );
+
+        std::panic::set_hook(original);
+    }
+
+    #[test]
+    fn restore_terminal_is_safe_when_no_terminal_was_entered() {
+        // Both calls underneath are documented as safe no-ops outside of
+        // raw mode / alt-screen, which the panic hook depends on.
+        restore_terminal();
+    }
 }

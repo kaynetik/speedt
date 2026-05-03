@@ -49,21 +49,28 @@ async fn run_with_tui(client: &reqwest::Client, cli: Cli) -> Result<()> {
         return run_plain(client, cli).await;
     }
 
+    // Install the panic hook *before* spawning the TUI so a panic in the
+    // spawned task — or in this one — finds the restore path already wired.
+    ui::tui::install_panic_hook();
+
     let (tx, rx) = tokio::sync::broadcast::channel::<ui::UiEvent>(UI_BUS_CAPACITY);
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let tui = tokio::spawn(ui::tui::run(rx, cancel_tx));
 
-    let session_result = match cli.command {
-        Command::Quick(opts) => {
-            session::run_quick(client, opts, cli.json, Some(&tx), Some(cancel_rx)).await
-        }
-        Command::Deep(opts) => {
-            session::run_deep(client, opts, cli.json, Some(&tx), Some(cancel_rx)).await
-        }
-        Command::Latency(opts) => {
-            session::run_latency_only(client, opts, cli.json, Some(&tx), Some(cancel_rx)).await
-        }
-        Command::Info => unreachable!("handled above"),
+    #[cfg(debug_assertions)]
+    if cli.panic_test {
+        // Give the TUI a moment to enter raw mode + alt screen so the panic
+        // hook has something meaningful to undo when it fires.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        panic!("--panic-test: deliberate panic to exercise the terminal-restore hook");
+    }
+
+    let session_result = tokio::select! {
+        // Race the session against SIGINT so the process exits as soon as the
+        // user hits Ctrl-C. The TUI also listens for SIGINT and breaks its
+        // loop, taking the same `leave()` restore path as `q`.
+        res = run_session(client, cli.command, cli.json, &tx, cancel_rx) => res,
+        _ = tokio::signal::ctrl_c() => Ok(()),
     };
 
     // Closing the bus signals the TUI to drain and exit (if the user hasn't
@@ -71,6 +78,27 @@ async fn run_with_tui(client: &reqwest::Client, cli: Cli) -> Result<()> {
     drop(tx);
     let _ = tui.await;
     session_result
+}
+
+async fn run_session(
+    client: &reqwest::Client,
+    command: Command,
+    json: bool,
+    tx: &ui::UiEventTx,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    match command {
+        Command::Quick(opts) => {
+            session::run_quick(client, opts, json, Some(tx), Some(cancel_rx)).await
+        }
+        Command::Deep(opts) => {
+            session::run_deep(client, opts, json, Some(tx), Some(cancel_rx)).await
+        }
+        Command::Latency(opts) => {
+            session::run_latency_only(client, opts, json, Some(tx), Some(cancel_rx)).await
+        }
+        Command::Info => unreachable!("handled by run_with_tui caller"),
+    }
 }
 
 fn init_tracing(verbose: u8) {

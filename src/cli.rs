@@ -25,6 +25,12 @@ pub struct Cli {
     /// `--json` always forces `plain`.
     #[arg(long, value_enum, default_value_t = UiMode::Auto, global = true)]
     pub ui: UiMode,
+
+    /// Debug-only: panic shortly after the TUI is up so the terminal-restore
+    /// hook can be exercised end-to-end. Hidden from --help.
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, hide = true)]
+    pub panic_test: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
