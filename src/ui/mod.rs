@@ -1,6 +1,8 @@
 use crate::report::{PhaseReport, SessionReport};
 use crate::sampler::Sample;
 
+pub mod tui;
+
 /// Which throughput phase a [`UiEvent`] refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhaseKind {

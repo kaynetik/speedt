@@ -24,7 +24,7 @@ hdrhistogram = "7"
 indicatif = "0.17"
 comfy-table = "7"
 ratatui = "0.28"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 is-terminal = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
