@@ -1,3 +1,4 @@
+use crate::metadata::Metadata;
 use crate::report::{PhaseReport, SessionReport};
 use crate::sampler::Sample;
 
@@ -22,7 +23,16 @@ pub enum ProbeKind {
 /// (TUI, JSON writer, structured-log forwarder, …).
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    PhaseStarted { kind: PhaseKind, planned_secs: f64 },
+    SessionStarted {
+        mode: &'static str,
+        total_planned_secs: f64,
+        metadata: Box<Metadata>,
+    },
+    PhaseStarted {
+        kind: PhaseKind,
+        label: &'static str,
+        planned_secs: f64,
+    },
     Throughput(Sample),
     LatencyProbe { kind: ProbeKind, rtt_us: u64 },
     PhaseFinished(PhaseReport),

@@ -48,6 +48,15 @@ pub async fn run_latency_only(
     let started_at = chrono::Utc::now();
     let pb = make_spinner(&format!("latency: {} probes", opts.probes));
     let md = metadata::fetch(client).await?;
+    let total_planned_secs =
+        f64::from(opts.probes) * (opts.spacing_ms as f64) / 1_000.0;
+    if let Some(tx) = tx {
+        let _ = tx.send(UiEvent::SessionStarted {
+            mode: "latency",
+            total_planned_secs,
+            metadata: Box::new(md.clone()),
+        });
+    }
     let samples = latency::measure(
         client,
         opts.probes,
@@ -75,6 +84,9 @@ pub async fn run_latency_only(
         download: None,
         upload: None,
     };
+    if let Some(tx) = tx {
+        let _ = tx.send(UiEvent::SessionFinished(Box::new(rep.clone())));
+    }
     if json {
         report::print_json(&rep)?;
     } else {
@@ -91,6 +103,18 @@ pub async fn run_quick(
 ) -> Result<()> {
     let started_at = chrono::Utc::now();
     let md = metadata::fetch(client).await?;
+
+    let idle_planned_secs =
+        f64::from(opts.latency_probes) * (PROBE_SPACING_MS as f64) / 1_000.0;
+    let dl_planned_secs = opts.download_secs as f64;
+    let ul_planned_secs = if opts.no_upload { 0.0 } else { opts.upload_secs as f64 };
+    if let Some(tx) = tx {
+        let _ = tx.send(UiEvent::SessionStarted {
+            mode: "quick",
+            total_planned_secs: idle_planned_secs + dl_planned_secs + ul_planned_secs,
+            metadata: Box::new(md.clone()),
+        });
+    }
 
     let pb = make_spinner("idle latency");
     let idle_samples = latency::measure(
@@ -152,6 +176,10 @@ pub async fn run_quick(
         upload,
     };
 
+    if let Some(tx) = tx {
+        let _ = tx.send(UiEvent::SessionFinished(Box::new(rep.clone())));
+    }
+
     if json {
         report::print_json(&rep)?;
     } else {
@@ -181,6 +209,14 @@ pub async fn run_deep(
     };
 
     let probes_per_idle = opts.latency_probes / 2;
+
+    if let Some(tx) = tx {
+        let _ = tx.send(UiEvent::SessionStarted {
+            mode: "deep",
+            total_planned_secs: total.as_secs_f64(),
+            metadata: Box::new(md.clone()),
+        });
+    }
 
     let pb = make_spinner(&format!("idle latency (start, ~{}s)", idle_each.as_secs()));
     let idle_start = latency::measure(
@@ -293,6 +329,10 @@ pub async fn run_deep(
         upload,
     };
 
+    if let Some(tx) = tx {
+        let _ = tx.send(UiEvent::SessionFinished(Box::new(rep.clone())));
+    }
+
     if json {
         report::print_json(&rep)?;
     } else {
@@ -310,6 +350,13 @@ async fn run_phase(
     kind: PhaseKind,
     tx: Option<&UiEventTx>,
 ) -> Result<PhaseReport> {
+    if let Some(tx) = tx {
+        let _ = tx.send(UiEvent::PhaseStarted {
+            kind,
+            label,
+            planned_secs: duration.as_secs_f64(),
+        });
+    }
     let sampler = Sampler::start(sample_ms, tx.cloned());
     let counter = sampler.counter();
     let (total_bytes, requests, errors) = match kind {
@@ -317,7 +364,11 @@ async fn run_phase(
         PhaseKind::Upload => upload::run(client, counter, duration, streams).await?,
     };
     let (timeline, _final_bytes, elapsed) = sampler.stop().await;
-    Ok(build_phase_report(label, total_bytes, requests, errors, elapsed, timeline))
+    let report = build_phase_report(label, total_bytes, requests, errors, elapsed, timeline);
+    if let Some(tx) = tx {
+        let _ = tx.send(UiEvent::PhaseFinished(report.clone()));
+    }
+    Ok(report)
 }
 
 async fn run_phase_with_loaded_latency(
@@ -330,6 +381,13 @@ async fn run_phase_with_loaded_latency(
     measure_loaded: bool,
     tx: Option<&UiEventTx>,
 ) -> Result<(PhaseReport, Vec<u64>)> {
+    if let Some(tx) = tx {
+        let _ = tx.send(UiEvent::PhaseStarted {
+            kind,
+            label,
+            planned_secs: duration.as_secs_f64(),
+        });
+    }
     let sampler = Sampler::start(sample_ms, tx.cloned());
     let counter = sampler.counter();
 
@@ -385,10 +443,11 @@ async fn run_phase_with_loaded_latency(
         None => Vec::new(),
     };
 
-    Ok((
-        build_phase_report(label, total_bytes, requests, errors, elapsed, timeline),
-        loaded,
-    ))
+    let report = build_phase_report(label, total_bytes, requests, errors, elapsed, timeline);
+    if let Some(tx) = tx {
+        let _ = tx.send(UiEvent::PhaseFinished(report.clone()));
+    }
+    Ok((report, loaded))
 }
 
 fn build_phase_report(
