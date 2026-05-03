@@ -1,0 +1,8 @@
+# Cargo build artefacts
+/target
+
+# Cargo.lock is intentionally tracked (binary crate)
+
+# Editor / OS noise
+**/*.rs.bk
+.DS_Store
