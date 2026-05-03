@@ -23,7 +23,9 @@ use tokio::time;
 
 use super::{PhaseKind, ProbeKind, UiEvent, UiEventRx};
 use crate::metadata::Metadata;
-use crate::report::{LatencyReport, PhaseReport, SessionReport};
+use crate::report::{
+    self, LatencyReport, PhaseReport, SessionReport, format_summary_card, summary_card,
+};
 use crate::sampler::Sample;
 use crate::stats::{BufferbloatGrade, LatencySummary};
 
@@ -72,7 +74,13 @@ pub async fn run(mut rx: UiEventRx, cancel_tx: watch::Sender<bool>) -> Result<()
     let mut terminal = enter()?;
     let result = run_loop(&mut terminal, &mut rx, &cancel_tx).await;
     leave(&mut terminal);
-    result
+    // After leaving the alt-screen, mirror the final report (if any) to
+    // stdout so the data lands in the user's scrollback, matching the plain
+    // renderer.
+    if let Ok(Some(final_report)) = &result {
+        report::print_human(final_report);
+    }
+    result.map(|_| ())
 }
 
 fn enter() -> Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -93,51 +101,79 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     rx: &mut UiEventRx,
     cancel_tx: &watch::Sender<bool>,
-) -> Result<()> {
+) -> Result<Option<Box<SessionReport>>> {
     let mut input = EventStream::new();
     let mut tick = time::interval(RENDER_INTERVAL);
     tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut state = State::default();
 
     loop {
-        tokio::select! {
-            biased;
-            // SIGINT mirrors `q`: signal cancel and break out so `leave()`
-            // restores the terminal. Process-level exit on SIGINT is also
-            // handled in `main` for the case where the TUI never started.
-            _ = tokio::signal::ctrl_c() => {
-                let _ = cancel_tx.send(true);
-                break;
-            }
-            ev = rx.recv() => match ev {
-                Ok(ev) => state.apply(ev),
-                Err(RecvError::Closed) => break,
-                Err(RecvError::Lagged(_)) => {}
-            },
-            key = input.next() => match key {
-                Some(Ok(Event::Key(k))) => match key_action(k) {
-                    Some(KeyAction::Quit) => {
-                        // Signal cancel and exit the loop. Restoring the
-                        // terminal here lets the engine's partial-report
-                        // printout land on a sane terminal afterwards.
-                        let _ = cancel_tx.send(true);
-                        break;
-                    }
-                    Some(KeyAction::Save) => {
-                        let result = save_report(&state);
-                        state.last_save = Some(SaveStatus { at: Instant::now(), result });
-                    }
-                    None => {}
+        // Once the session has finished, the engine will close the bus
+        // shortly after sending `SessionFinished`. Stop polling the bus then
+        // so the close doesn't tear down the results view — the user is
+        // reading it.
+        if state.final_report.is_some() {
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => break,
+                key = input.next() => match key {
+                    Some(Ok(Event::Key(k))) => match key_action(k) {
+                        Some(KeyAction::Quit) => break,
+                        Some(KeyAction::Save) => {
+                            let result = save_report(&state);
+                            state.last_save = Some(SaveStatus { at: Instant::now(), result });
+                        }
+                        None => {}
+                    },
+                    Some(Ok(_) | Err(_)) => {}
+                    None => break,
                 },
-                Some(Ok(_) | Err(_)) => {}
-                None => break,
-            },
-            _ = tick.tick() => {
-                terminal.draw(|f| draw(f, &state))?;
+                _ = tick.tick() => {
+                    terminal.draw(|f| draw(f, &state))?;
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                // SIGINT mirrors `q`: signal cancel and break out so `leave()`
+                // restores the terminal. Process-level exit on SIGINT is also
+                // handled in `main` for the case where the TUI never started.
+                _ = tokio::signal::ctrl_c() => {
+                    let _ = cancel_tx.send(true);
+                    break;
+                }
+                ev = rx.recv() => match ev {
+                    Ok(ev) => state.apply(ev),
+                    // Bus closed mid-session — engine aborted before sending
+                    // `SessionFinished`. Nothing meaningful left to render.
+                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Lagged(_)) => {}
+                },
+                key = input.next() => match key {
+                    Some(Ok(Event::Key(k))) => match key_action(k) {
+                        Some(KeyAction::Quit) => {
+                            // Signal cancel and exit the loop. Restoring the
+                            // terminal here lets the engine's partial-report
+                            // printout land on a sane terminal afterwards.
+                            let _ = cancel_tx.send(true);
+                            break;
+                        }
+                        Some(KeyAction::Save) => {
+                            let result = save_report(&state);
+                            state.last_save = Some(SaveStatus { at: Instant::now(), result });
+                        }
+                        None => {}
+                    },
+                    Some(Ok(_) | Err(_)) => {}
+                    None => break,
+                },
+                _ = tick.tick() => {
+                    terminal.draw(|f| draw(f, &state))?;
+                }
             }
         }
     }
-    Ok(())
+    Ok(state.final_report)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -173,6 +209,14 @@ struct State {
 
     last_error: Option<String>,
     last_save: Option<SaveStatus>,
+
+    /// Final report received via `SessionFinished`. Its presence flips the
+    /// TUI into "results view" mode and is what we mirror to scrollback on
+    /// quit.
+    final_report: Option<Box<SessionReport>>,
+    /// Frozen elapsed time at the moment `SessionFinished` arrived, so the
+    /// header clock stops advancing once the session is done.
+    final_elapsed_secs: Option<f64>,
 }
 
 struct SaveStatus {
@@ -238,14 +282,19 @@ impl State {
                 self.finished.push(rep);
                 self.active = None;
             }
-            UiEvent::SessionFinished(_) => {
+            UiEvent::SessionFinished(rep) => {
                 self.active = None;
+                self.final_elapsed_secs = Some(self.session_elapsed_secs());
+                self.final_report = Some(rep);
             }
             UiEvent::Error(e) => self.last_error = Some(e),
         }
     }
 
     fn session_elapsed_secs(&self) -> f64 {
+        if let Some(secs) = self.final_elapsed_secs {
+            return secs;
+        }
         self.session_started_at
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(0.0)
@@ -253,20 +302,33 @@ impl State {
 }
 
 fn draw(f: &mut ratatui::Frame, state: &State) {
+    // Results view adds a one-line summary card under the latency table.
+    let summary_height: u16 = if state.final_report.is_some() { 3 } else { 0 };
+
+    let mut constraints: Vec<Constraint> = vec![
+        Constraint::Length(4), // Header
+        Constraint::Min(0),    // Phase area (elastic)
+        Constraint::Length(5), // Latency
+    ];
+    if summary_height > 0 {
+        constraints.push(Constraint::Length(summary_height));
+    }
+    constraints.push(Constraint::Length(3)); // Footer
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),  // Header
-            Constraint::Min(0),     // Phase area (elastic)
-            Constraint::Length(5),  // Latency
-            Constraint::Length(3),  // Footer
-        ])
+        .constraints(constraints)
         .split(f.area());
 
     draw_header(f, chunks[0], state);
     draw_phase_area(f, chunks[1], state);
     draw_latency(f, chunks[2], state);
-    draw_footer(f, chunks[3], state);
+    if summary_height > 0 {
+        draw_summary_card(f, chunks[3], state);
+        draw_footer(f, chunks[4], state);
+    } else {
+        draw_footer(f, chunks[3], state);
+    }
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &State) {
@@ -330,8 +392,28 @@ fn metadata_segments(md: Option<&Metadata>) -> Vec<Span<'static>> {
 }
 
 fn draw_phase_area(f: &mut ratatui::Frame, area: Rect, state: &State) {
-    // Each finished phase collapses to a 4-line card (2 content + borders).
-    // The active phase (if any) takes the remaining space.
+    // Results view: expand each finished phase into a full-detail card,
+    // splitting the phase region equally between them.
+    if state.final_report.is_some() && !state.finished.is_empty() {
+        let n = state.finished.len() as u32;
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(
+                state
+                    .finished
+                    .iter()
+                    .map(|_| Constraint::Ratio(1, n))
+                    .collect::<Vec<_>>(),
+            )
+            .split(area);
+        for (i, rep) in state.finished.iter().enumerate() {
+            draw_expanded_phase(f, rows[i], rep);
+        }
+        return;
+    }
+
+    // Live view: each finished phase collapses to a 4-line card (2 content +
+    // borders); the active phase (if any) takes the remaining space.
     let mut constraints: Vec<Constraint> = state
         .finished
         .iter()
@@ -475,6 +557,43 @@ fn draw_active_phase(f: &mut ratatui::Frame, area: Rect, active: &ActivePhase) {
     f.render_widget(Paragraph::new(stats), chunks[2]);
 }
 
+fn draw_expanded_phase(f: &mut ratatui::Frame, area: Rect, rep: &PhaseReport) {
+    let title = format!(" {} \u{2713} ", rep.label);
+    let s = &rep.timeline_summary;
+    let lines = vec![
+        Line::from(format!(
+            "mean {:.2} Mbps   stable {}   TTS {}",
+            rep.mean_mbps,
+            fmt_opt_mbps(rep.stable_mbps),
+            fmt_opt_secs(rep.time_to_saturation_secs),
+        )),
+        Line::from(format!(
+            "p50 {:>7.2}   p75 {:>7.2}   p90 {:>7.2}   p95 {:>7.2}   p99 {:>7.2}",
+            s.p50, s.p75, s.p90, s.p95, s.p99,
+        )),
+        Line::from(format!(
+            "min {:>7.2}   max {:>7.2}   stdev {:>6.2}   bytes {}",
+            s.min,
+            s.max,
+            s.stdev,
+            fmt_bytes(rep.total_bytes),
+        )),
+        Line::from(format!(
+            "duration {:.2} s   requests {}   errors {}",
+            rep.duration_secs, rep.requests, rep.errors,
+        )),
+    ];
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                title,
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )),
+    );
+    f.render_widget(para, area);
+}
+
 fn draw_latency(f: &mut ratatui::Frame, area: Rect, state: &State) {
     let idle_p50 = u64_p50_ms(&state.idle_rtts_us);
     let loaded_dl_p50 = u64_p50_ms(&state.loaded_dl_rtts_us);
@@ -553,7 +672,24 @@ fn bufferbloat(idle_p50: Option<f64>, loaded_p50: Option<f64>) -> Option<Bufferb
     Some(BufferbloatGrade::from_added((loaded - idle).max(0.0)))
 }
 
+fn draw_summary_card(f: &mut ratatui::Frame, area: Rect, state: &State) {
+    let Some(rep) = state.final_report.as_deref() else {
+        return;
+    };
+    let card = summary_card(rep);
+    let para = Paragraph::new(format_summary_card(&card))
+        .style(Style::default().add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::ALL).title(" summary "));
+    f.render_widget(para, area);
+}
+
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, state: &State) {
+    let in_results = state.final_report.is_some();
+    let quit_suffix = if in_results {
+        " quit (results will be written to the terminal)"
+    } else {
+        " quit"
+    };
     let mut spans: Vec<Span<'static>> = Vec::new();
     if let Some(err) = &state.last_error {
         spans.push(Span::styled(
@@ -564,10 +700,15 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, state: &State) {
         spans.push(Span::raw("    "));
     }
     spans.push(Span::styled("q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
-    spans.push(Span::styled(" quit", Style::default().fg(Color::DarkGray)));
-    spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
-    spans.push(Span::styled("s", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
-    spans.push(Span::styled(" save report", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(quit_suffix, Style::default().fg(Color::DarkGray)));
+    if !in_results {
+        spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "s",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" save report", Style::default().fg(Color::DarkGray)));
+    }
     if let Some(flash) = save_flash_span(state) {
         spans.push(Span::raw("    "));
         spans.push(flash);

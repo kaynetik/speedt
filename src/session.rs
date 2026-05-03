@@ -96,7 +96,7 @@ pub async fn run_latency_only(
     }
     if json {
         report::print_json(&rep)?;
-    } else {
+    } else if tx.is_none() {
         report::print_human(&rep);
     }
     Ok(())
@@ -202,7 +202,7 @@ pub async fn run_quick(
 
     if json {
         report::print_json(&rep)?;
-    } else {
+    } else if tx.is_none() {
         report::print_human(&rep);
     }
     Ok(())
@@ -373,7 +373,7 @@ pub async fn run_deep(
 
     if json {
         report::print_json(&rep)?;
-    } else {
+    } else if tx.is_none() {
         report::print_human(&rep);
     }
     Ok(())

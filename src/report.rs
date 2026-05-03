@@ -181,24 +181,45 @@ fn print_phase(p: &PhaseReport) {
     println!("\n{t}");
 }
 
+/// Pure-data view of the headline numbers shown in the bottom summary card.
+/// Shared between the plain renderer and the TUI's results screen so they
+/// stay byte-for-byte identical.
+pub struct SummaryCard {
+    pub dl_mean_mbps: f64,
+    pub ul_mean_mbps: f64,
+    pub idle_p50_ms: f64,
+    pub bufferbloat: String,
+}
+
+pub fn summary_card(rep: &SessionReport) -> SummaryCard {
+    SummaryCard {
+        dl_mean_mbps: rep.download.as_ref().map(|d| d.mean_mbps).unwrap_or(0.0),
+        ul_mean_mbps: rep.upload.as_ref().map(|u| u.mean_mbps).unwrap_or(0.0),
+        idle_p50_ms: rep
+            .latency
+            .idle
+            .as_ref()
+            .map(|s| s.p50_ms)
+            .unwrap_or(0.0),
+        bufferbloat: rep
+            .latency
+            .bufferbloat_download
+            .map(|b| format!("+{:.0} ms ({})", b.added_latency_ms, b.grade))
+            .unwrap_or_else(|| "-".to_string()),
+    }
+}
+
+/// Format the summary card as a single line — matches the bottom card of the
+/// human renderer (without the leading newline, so callers can place it).
+pub fn format_summary_card(card: &SummaryCard) -> String {
+    format!(
+        "  ⇣ {:>8.2} Mbps   ⇡ {:>8.2} Mbps   ping {:>5.1} ms   bufferbloat {}",
+        card.dl_mean_mbps, card.ul_mean_mbps, card.idle_p50_ms, card.bufferbloat
+    )
+}
+
 fn print_summary_card(rep: &SessionReport) {
-    let dl_mean = rep.download.as_ref().map(|d| d.mean_mbps).unwrap_or(0.0);
-    let ul_mean = rep.upload.as_ref().map(|u| u.mean_mbps).unwrap_or(0.0);
-    let idle_p50 = rep
-        .latency
-        .idle
-        .as_ref()
-        .map(|s| s.p50_ms)
-        .unwrap_or(0.0);
-    let bb = rep
-        .latency
-        .bufferbloat_download
-        .map(|b| format!("+{:.0} ms ({})", b.added_latency_ms, b.grade))
-        .unwrap_or_else(|| "-".to_string());
-    println!(
-        "\n  ⇣ {:>8.2} Mbps   ⇡ {:>8.2} Mbps   ping {:>5.1} ms   bufferbloat {}",
-        dl_mean, ul_mean, idle_p50, bb
-    );
+    println!("\n{}", format_summary_card(&summary_card(rep)));
 }
 
 fn fmt_mbps(v: f64) -> String {
