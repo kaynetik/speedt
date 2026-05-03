@@ -73,10 +73,7 @@ fn print_metadata(md: &Metadata) {
 
     let na = || "-".to_string();
     t.add_row(vec!["Client IP", md.client_ip.as_deref().unwrap_or("-")]);
-    let asn = md
-        .asn
-        .map(|a| format!("AS{a}"))
-        .unwrap_or_else(na);
+    let asn = md.asn.map(|a| format!("AS{a}")).unwrap_or_else(na);
     let org = md.as_organization.clone().unwrap_or_else(na);
     t.add_row(vec!["ISP / ASN", &format!("{org} ({asn})")]);
     let geo = format!(
@@ -195,12 +192,7 @@ pub fn summary_card(rep: &SessionReport) -> SummaryCard {
     SummaryCard {
         dl_mean_mbps: rep.download.as_ref().map(|d| d.mean_mbps).unwrap_or(0.0),
         ul_mean_mbps: rep.upload.as_ref().map(|u| u.mean_mbps).unwrap_or(0.0),
-        idle_p50_ms: rep
-            .latency
-            .idle
-            .as_ref()
-            .map(|s| s.p50_ms)
-            .unwrap_or(0.0),
+        idle_p50_ms: rep.latency.idle.as_ref().map(|s| s.p50_ms).unwrap_or(0.0),
         bufferbloat: rep
             .latency
             .bufferbloat_download

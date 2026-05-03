@@ -50,8 +50,7 @@ pub async fn run_latency_only(
     let started_at = chrono::Utc::now();
     let pb = make_spinner(&format!("latency: {} probes", opts.probes));
     let md = metadata::fetch(client).await?;
-    let total_planned_secs =
-        f64::from(opts.probes) * (opts.spacing_ms as f64) / 1_000.0;
+    let total_planned_secs = f64::from(opts.probes) * (opts.spacing_ms as f64) / 1_000.0;
     if let Some(tx) = tx {
         let _ = tx.send(UiEvent::SessionStarted {
             mode: "latency",
@@ -112,10 +111,13 @@ pub async fn run_quick(
     let started_at = chrono::Utc::now();
     let md = metadata::fetch(client).await?;
 
-    let idle_planned_secs =
-        f64::from(opts.latency_probes) * (PROBE_SPACING_MS as f64) / 1_000.0;
+    let idle_planned_secs = f64::from(opts.latency_probes) * (PROBE_SPACING_MS as f64) / 1_000.0;
     let dl_planned_secs = opts.download_secs as f64;
-    let ul_planned_secs = if opts.no_upload { 0.0 } else { opts.upload_secs as f64 };
+    let ul_planned_secs = if opts.no_upload {
+        0.0
+    } else {
+        opts.upload_secs as f64
+    };
     if let Some(tx) = tx {
         let _ = tx.send(UiEvent::SessionStarted {
             mode: "quick",
@@ -145,7 +147,10 @@ pub async fn run_quick(
     let download = if cancelled(cancel.as_ref()) {
         None
     } else {
-        let pb = make_spinner(&format!("download {}s @ {} streams", opts.download_secs, opts.streams));
+        let pb = make_spinner(&format!(
+            "download {}s @ {} streams",
+            opts.download_secs, opts.streams
+        ));
         let r = run_phase(
             client,
             "download",
@@ -164,7 +169,10 @@ pub async fn run_quick(
     let upload = if opts.no_upload || cancelled(cancel.as_ref()) {
         None
     } else {
-        let pb = make_spinner(&format!("upload {}s @ {} streams", opts.upload_secs, opts.streams));
+        let pb = make_spinner(&format!(
+            "upload {}s @ {} streams",
+            opts.upload_secs, opts.streams
+        ));
         let r = run_phase(
             client,
             "upload",
@@ -383,6 +391,7 @@ pub async fn run_deep(
 /// (or its deadline elapsed). Returns `None` only if the user cancelled
 /// before any work happened, so the caller can omit the phase from the
 /// session report rather than emit a near-empty placeholder.
+#[allow(clippy::too_many_arguments)]
 async fn run_phase(
     client: &reqwest::Client,
     label: &'static str,
@@ -428,6 +437,7 @@ async fn run_phase(
     Ok(Some(report))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_phase_with_loaded_latency(
     client: &reqwest::Client,
     label: &'static str,
@@ -469,11 +479,9 @@ async fn run_phase_with_loaded_latency(
             // Skip the first 2 seconds to avoid TCP/TLS warmup contamination.
             tokio::time::sleep(Duration::from_secs(2)).await;
             let mut samples = Vec::with_capacity(256);
-            let stop_at = std::time::Instant::now()
-                + duration.saturating_sub(Duration::from_secs(3));
-            while std::time::Instant::now() < stop_at
-                && !stop.load(Ordering::Relaxed)
-            {
+            let stop_at =
+                std::time::Instant::now() + duration.saturating_sub(Duration::from_secs(3));
+            while std::time::Instant::now() < stop_at && !stop.load(Ordering::Relaxed) {
                 let t = std::time::Instant::now();
                 let url = crate::config::download_url(crate::config::LATENCY_BYTES);
                 if let Ok(resp) = probe_client.get(url).send().await {
@@ -481,7 +489,10 @@ async fn run_phase_with_loaded_latency(
                     let rtt_us = t.elapsed().as_micros() as u64;
                     samples.push(rtt_us);
                     if let Some(tx) = &probe_tx {
-                        let _ = tx.send(UiEvent::LatencyProbe { kind: probe_kind, rtt_us });
+                        let _ = tx.send(UiEvent::LatencyProbe {
+                            kind: probe_kind,
+                            rtt_us,
+                        });
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -561,7 +572,10 @@ fn build_phase_report(
     // and TLS handshake artifacts make those samples not representative of
     // steady-state throughput.
     let warmup_secs = 1.0;
-    let post_warmup: Vec<&Sample> = timeline.iter().filter(|s| s.t_secs >= warmup_secs).collect();
+    let post_warmup: Vec<&Sample> = timeline
+        .iter()
+        .filter(|s| s.t_secs >= warmup_secs)
+        .collect();
     let mbps_samples: Vec<f64> = post_warmup.iter().map(|s| s.mbps).collect();
     let timeline_summary = Summary::from_samples(&mbps_samples);
 

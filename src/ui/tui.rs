@@ -252,14 +252,23 @@ impl ActivePhase {
 impl State {
     fn apply(&mut self, ev: UiEvent) {
         match ev {
-            UiEvent::SessionStarted { mode, total_planned_secs, metadata, started_at } => {
+            UiEvent::SessionStarted {
+                mode,
+                total_planned_secs,
+                metadata,
+                started_at,
+            } => {
                 self.mode = Some(mode);
                 self.metadata = Some(metadata);
                 self.session_started_at = Some(Instant::now());
                 self.session_started_at_utc = Some(started_at);
                 self.total_planned_secs = total_planned_secs;
             }
-            UiEvent::PhaseStarted { kind, label, planned_secs } => {
+            UiEvent::PhaseStarted {
+                kind,
+                label,
+                planned_secs,
+            } => {
                 self.active = Some(ActivePhase {
                     kind,
                     label,
@@ -473,12 +482,12 @@ fn draw_finished_card(f: &mut ratatui::Frame, area: Rect, rep: &PhaseReport) {
     let para = Paragraph::new(vec![Line::from(line1), Line::from(line2)])
         .style(Style::default().fg(Color::DarkGray))
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    title,
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                )),
+            Block::default().borders(Borders::ALL).title(Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
         );
     f.render_widget(para, area);
 }
@@ -584,12 +593,12 @@ fn draw_expanded_phase(f: &mut ratatui::Frame, area: Rect, rep: &PhaseReport) {
         )),
     ];
     let para = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                title,
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            )),
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
     );
     f.render_widget(para, area);
 }
@@ -650,7 +659,11 @@ fn grade_cell(bb: Option<BufferbloatGrade>) -> Cell<'static> {
     if bb.grade == 'F' {
         style = style.add_modifier(Modifier::BOLD);
     }
-    Cell::from(format!("+{:>5.1} ms  grade {}", bb.added_latency_ms, bb.grade)).style(style)
+    Cell::from(format!(
+        "+{:>5.1} ms  grade {}",
+        bb.added_latency_ms, bb.grade
+    ))
+    .style(style)
 }
 
 fn grade_color(grade: char) -> Color {
@@ -699,15 +712,28 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, state: &State) {
         spans.push(Span::raw(err.clone()));
         spans.push(Span::raw("    "));
     }
-    spans.push(Span::styled("q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
-    spans.push(Span::styled(quit_suffix, Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        "q",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        quit_suffix,
+        Style::default().fg(Color::DarkGray),
+    ));
     if !in_results {
         spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(
             "s",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(" save report", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            " save report",
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     if let Some(flash) = save_flash_span(state) {
         spans.push(Span::raw("    "));
@@ -757,29 +783,25 @@ fn build_partial_report(state: &State) -> SessionReport {
         .iter()
         .find(|p| p.label == "download")
         .cloned();
-    let upload = state
-        .finished
-        .iter()
-        .find(|p| p.label == "upload")
-        .cloned();
+    let upload = state.finished.iter().find(|p| p.label == "upload").cloned();
 
-    let idle = (!state.idle_rtts_us.is_empty())
-        .then(|| LatencySummary::from_micros(&state.idle_rtts_us));
+    let idle =
+        (!state.idle_rtts_us.is_empty()).then(|| LatencySummary::from_micros(&state.idle_rtts_us));
     let loaded_dl = (!state.loaded_dl_rtts_us.is_empty())
         .then(|| LatencySummary::from_micros(&state.loaded_dl_rtts_us));
     let loaded_ul = (!state.loaded_ul_rtts_us.is_empty())
         .then(|| LatencySummary::from_micros(&state.loaded_ul_rtts_us));
 
     let bb_dl = match (idle.as_ref(), loaded_dl.as_ref()) {
-        (Some(i), Some(l)) if i.p50_ms > 0.0 => Some(BufferbloatGrade::from_added(
-            (l.p50_ms - i.p50_ms).max(0.0),
-        )),
+        (Some(i), Some(l)) if i.p50_ms > 0.0 => {
+            Some(BufferbloatGrade::from_added((l.p50_ms - i.p50_ms).max(0.0)))
+        }
         _ => None,
     };
     let bb_ul = match (idle.as_ref(), loaded_ul.as_ref()) {
-        (Some(i), Some(l)) if i.p50_ms > 0.0 => Some(BufferbloatGrade::from_added(
-            (l.p50_ms - i.p50_ms).max(0.0),
-        )),
+        (Some(i), Some(l)) if i.p50_ms > 0.0 => {
+            Some(BufferbloatGrade::from_added((l.p50_ms - i.p50_ms).max(0.0)))
+        }
         _ => None,
     };
 
@@ -789,11 +811,7 @@ fn build_partial_report(state: &State) -> SessionReport {
             .session_started_at_utc
             .unwrap_or_else(chrono::Utc::now),
         ended_at: chrono::Utc::now(),
-        metadata: state
-            .metadata
-            .as_deref()
-            .cloned()
-            .unwrap_or_default(),
+        metadata: state.metadata.as_deref().cloned().unwrap_or_default(),
         latency: LatencyReport {
             idle,
             loaded_download: loaded_dl,
@@ -828,7 +846,11 @@ fn fmt_opt_ms(v: Option<f64>) -> String {
 }
 
 fn fmt_count(n: usize) -> String {
-    if n == 0 { "-".to_string() } else { n.to_string() }
+    if n == 0 {
+        "-".to_string()
+    } else {
+        n.to_string()
+    }
 }
 
 fn fmt_bytes(b: u64) -> String {
@@ -927,7 +949,10 @@ mod tests {
         install_panic_hook();
 
         let result = std::panic::catch_unwind(|| panic!("hook-test"));
-        assert!(result.is_err(), "panic should propagate through catch_unwind");
+        assert!(
+            result.is_err(),
+            "panic should propagate through catch_unwind"
+        );
         assert_eq!(
             PREV_CALLS.load(Ordering::SeqCst),
             1,
@@ -942,5 +967,62 @@ mod tests {
         // Both calls underneath are documented as safe no-ops outside of
         // raw mode / alt-screen, which the panic hook depends on.
         restore_terminal();
+    }
+
+    fn sample(t: f64, mbps: f64) -> Sample {
+        Sample {
+            t_secs: t,
+            mbps,
+            cumulative_bytes: 0,
+        }
+    }
+
+    fn make_phase() -> ActivePhase {
+        ActivePhase {
+            kind: PhaseKind::Download,
+            label: "download",
+            started_at: Instant::now(),
+            planned_secs: 10.0,
+            samples: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn ring_buffer_wraps_at_capacity_and_keeps_last_n() {
+        let mut p = make_phase();
+        // Push 1.5x capacity; oldest entries must be evicted in FIFO order.
+        for i in 0..(SAMPLE_BUFFER_CAP + 120) {
+            p.push_sample(sample(i as f64 * 0.1, i as f64));
+        }
+        assert_eq!(p.samples.len(), SAMPLE_BUFFER_CAP);
+        // First retained sample is the (n - CAP)th push.
+        let first = p.samples.front().expect("non-empty after push");
+        assert!(
+            (first.mbps - 120.0).abs() < f64::EPSILON,
+            "front should be the 120th push (oldest after eviction), got {}",
+            first.mbps
+        );
+        // Last retained sample is the most recent push.
+        let last = p.samples.back().expect("non-empty after push");
+        assert!(
+            (last.mbps - (SAMPLE_BUFFER_CAP + 119) as f64).abs() < f64::EPSILON,
+            "back should be the most recent push, got {}",
+            last.mbps
+        );
+    }
+
+    #[test]
+    fn ring_buffer_preserves_insertion_order_for_sparkline() {
+        let mut p = make_phase();
+        for i in 0..50 {
+            p.push_sample(sample(i as f64 * 0.1, i as f64));
+        }
+        let mbps: Vec<f64> = p.samples.iter().map(|s| s.mbps).collect();
+        assert_eq!(mbps.len(), 50);
+        assert_eq!(mbps.first().copied(), Some(0.0));
+        assert_eq!(mbps.last().copied(), Some(49.0));
+        for win in mbps.windows(2) {
+            assert!(win[1] > win[0], "sparkline order must be insertion order");
+        }
     }
 }

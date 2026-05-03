@@ -35,9 +35,15 @@ pub enum UiEvent {
         planned_secs: f64,
     },
     Throughput(Sample),
-    LatencyProbe { kind: ProbeKind, rtt_us: u64 },
+    LatencyProbe {
+        kind: ProbeKind,
+        rtt_us: u64,
+    },
     PhaseFinished(PhaseReport),
     SessionFinished(Box<SessionReport>),
+    /// Reserved for future error fan-out. Consumers (TUI footer) already
+    /// render this; the engine has no emit site yet, so silence dead-code.
+    #[allow(dead_code)]
     Error(String),
 }
 

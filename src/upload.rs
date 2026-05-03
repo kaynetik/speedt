@@ -65,10 +65,8 @@ pub async fn run(
         });
     }
 
-    let _ = tokio::time::timeout(duration, async {
-        while set.join_next().await.is_some() {}
-    })
-    .await;
+    let _ =
+        tokio::time::timeout(duration, async { while set.join_next().await.is_some() {} }).await;
     set.shutdown().await;
 
     Ok((

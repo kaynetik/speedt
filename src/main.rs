@@ -1,14 +1,14 @@
 mod cli;
 mod config;
-mod metadata;
-mod latency;
-mod sampler;
 mod download;
-mod upload;
-mod stats;
+mod latency;
+mod metadata;
 mod report;
+mod sampler;
 mod session;
+mod stats;
 mod ui;
+mod upload;
 
 use anyhow::Result;
 use clap::Parser;
