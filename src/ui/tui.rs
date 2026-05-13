@@ -212,6 +212,10 @@ struct State {
     /// by `s` (save report) so the saved JSON matches the `--json` shape.
     session_started_at_utc: Option<chrono::DateTime<chrono::Utc>>,
     total_planned_secs: f64,
+    /// Total idle probes the engine plans to emit, used to render
+    /// `collected/planned` in the latency table. Zero means "unknown" and the
+    /// table falls back to the bare collected count.
+    idle_probes_planned: u32,
 
     active: Option<ActivePhase>,
     finished: Vec<PhaseReport>,
@@ -272,12 +276,15 @@ impl State {
                 total_planned_secs,
                 metadata,
                 started_at,
+                idle_probes_planned,
+                loaded_probes_planned: _,
             } => {
                 self.mode = Some(mode);
                 self.metadata = Some(metadata);
                 self.session_started_at = Some(Instant::now());
                 self.session_started_at_utc = Some(started_at);
                 self.total_planned_secs = total_planned_secs;
+                self.idle_probes_planned = idle_probes_planned;
             }
             UiEvent::PhaseStarted {
                 kind,
@@ -712,7 +719,10 @@ fn draw_latency(f: &mut ratatui::Frame, area: Rect, state: &State) {
     let rows = vec![
         Row::new(vec![
             Cell::from("idle"),
-            Cell::from(fmt_count(state.idle_rtts_us.len())),
+            Cell::from(fmt_fraction(
+                state.idle_rtts_us.len(),
+                state.idle_probes_planned,
+            )),
             Cell::from(fmt_opt_ms(idle_p50)),
             Cell::from(fmt_opt_ms(u64_pct_ms(&state.idle_rtts_us, 95.0))),
             Cell::from(fmt_opt_ms(u64_stdev_ms(&state.idle_rtts_us))),
@@ -738,7 +748,7 @@ fn draw_latency(f: &mut ratatui::Frame, area: Rect, state: &State) {
 
     let widths = [
         Constraint::Length(16),
-        Constraint::Length(6),
+        Constraint::Length(8),
         Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Length(12),
@@ -957,6 +967,14 @@ fn fmt_count(n: usize) -> String {
         "-".to_string()
     } else {
         n.to_string()
+    }
+}
+
+fn fmt_fraction(collected: usize, planned: u32) -> String {
+    if planned > 0 {
+        format!("{collected}/{planned}")
+    } else {
+        fmt_count(collected)
     }
 }
 

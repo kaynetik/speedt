@@ -29,6 +29,15 @@ pub enum UiEvent {
         total_planned_secs: f64,
         metadata: Box<Metadata>,
         started_at: chrono::DateTime<chrono::Utc>,
+        /// Total number of idle latency probes the session plans to emit. The
+        /// TUI uses this to render a collected-vs-planned fraction.
+        idle_probes_planned: u32,
+        /// Total loaded-latency probes planned across both throughput phases.
+        /// Zero when bufferbloat measurement is disabled or the mode does not
+        /// run loaded probes. Reserved for future consumers (the TUI does not
+        /// surface it yet).
+        #[allow(dead_code)]
+        loaded_probes_planned: u32,
     },
     PhaseStarted {
         kind: PhaseKind,

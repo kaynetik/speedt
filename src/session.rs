@@ -57,6 +57,8 @@ pub async fn run_latency_only(
             total_planned_secs,
             metadata: Box::new(md.clone()),
             started_at,
+            idle_probes_planned: opts.probes,
+            loaded_probes_planned: 0,
         });
     }
     let samples = latency::measure(
@@ -124,6 +126,8 @@ pub async fn run_quick(
             total_planned_secs: idle_planned_secs + dl_planned_secs + ul_planned_secs,
             metadata: Box::new(md.clone()),
             started_at,
+            idle_probes_planned: opts.latency_probes,
+            loaded_probes_planned: 0,
         });
     }
 
@@ -239,12 +243,26 @@ pub async fn run_deep(
 
     let probes_per_idle = opts.latency_probes / 2;
 
+    // Loaded probes: 2s warmup skip + 3s tail skip + 250ms spacing, run during
+    // each throughput phase. Reflect the engine's actual schedule so the TUI
+    // fraction lines up with what eventually arrives.
+    let loaded_probes_planned = if opts.no_bufferbloat {
+        0
+    } else {
+        let est = |d: Duration| -> u32 {
+            ((d.as_secs_f64() - 5.0).max(0.0) / 0.25) as u32
+        };
+        est(dl_dur) + est(ul_dur)
+    };
+
     if let Some(tx) = tx {
         let _ = tx.send(UiEvent::SessionStarted {
             mode: "deep",
             total_planned_secs: total.as_secs_f64(),
             metadata: Box::new(md.clone()),
             started_at,
+            idle_probes_planned: probes_per_idle * 2,
+            loaded_probes_planned,
         });
     }
 
