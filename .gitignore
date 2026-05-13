@@ -6,3 +6,6 @@
 # Editor / OS noise
 **/*.rs.bk
 .DS_Store
+
+# Runtime-generated speed-test result snapshots
+speedt-*.json

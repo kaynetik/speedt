@@ -1,0 +1,208 @@
+{
+  "generated_at": "2026-05-13T05:16:00Z",
+  "project": "speedt",
+  "baseline": {
+    "description": "Current TUI state as of May 2026, based on full code audit of src/ui/tui.rs (1029 lines) and src/ui/mod.rs.",
+    "framework": "ratatui + crossterm, Rust async (tokio), broadcast event bus",
+    "render_cadence_ms": 33,
+    "sample_buffer_cap": 240,
+    "layout": {
+      "sections": ["header (4 lines)", "phase area (elastic)", "latency (5 lines)", "summary card (3 lines, results only)", "footer (3 lines)"],
+      "mode_switching": "Flat state: live view vs results view, toggled by presence of final_report"
+    },
+    "keybindings": {
+      "q": "quit",
+      "s": "save report (live view only — absent from results view)"
+    },
+    "stability_gaps": [
+      "No minimum terminal size guard — renders garbled on tiny windows (<80x24).",
+      "No terminal resize event handling — layout does not reflow after resize.",
+      "Only one error slot (last_error: Option<String>) — a second error silently overwrites the first.",
+      "`s` (save) only active during live run; footer hides the hint in results view, even though save_report() works fine at that point.",
+      "save_flash_span uses Instant::elapsed which is correct, but the flash is only cleared on the next render tick; no explicit cancel path.",
+      "UiEvent::Error has no emit site in the engine yet — dead variant, but TUI already renders it."
+    ],
+    "visual_consistency_gaps": [
+      "All colors hardcoded inline as ratatui::style::Color literals (Cyan, Magenta, Green, Yellow, Red, DarkGray, Rgb(184,134,11)) — no semantic abstraction layer.",
+      "No $NO_COLOR / $COLORTERM detection — always renders with full color regardless of environment.",
+      "Sparkline has no scale annotation — user cannot read the Y-axis magnitude.",
+      "Latency table column widths are fixed Constraint::Length values; can overflow or waste space on narrow/wide terminals.",
+      "Finished phase card title uses raw Unicode ✓ (U+2713); in-progress title uses LIVE label without a visual pulse/animation to indicate activity.",
+      "No visual separator or distinct styling between completed-phase cards and the active phase block.",
+      "Summary card bottom line uses ⇣ / ⇡ symbols that may not render on restricted ANSI terminals."
+    ],
+    "helpfulness_gaps": [
+      "No ? help overlay — keybinding discoverability relies entirely on the 3-char footer.",
+      "Footer shows only `q quit · s save report`; there is no hint that ? exists.",
+      "Header shows elapsed / total time but no overall session progress percentage or ETA.",
+      "TUI latency panel omits jitter (stdev) column shown in the plain renderer — information regression.",
+      "Latency sparkline history absent — no visual trend for RTT over the session lifetime.",
+      "Waiting placeholder text ('waiting for first phase…') is passive and gives no indication the tool is actively connecting or measuring idle latency.",
+      "No indication of how many latency probes have been collected vs total planned (count is shown but not as a progress fraction).",
+      "No live throughput peak annotation on sparkline (no max-so-far marker)."
+    ]
+  },
+  "research": {
+    "sources": [
+      "https://hyperbliss.tech/blog/2026.04.04_terminal-renaissance/",
+      "https://guidesfor.dev/ratatui-mastery-guide-2026/11-styling-theming/",
+      "https://guidesfor.dev/ratatui-mastery-guide-2026/06-layout-management/",
+      "GitHub TUIKit foundations.md (github/TUIKit)"
+    ],
+    "key_findings": {
+      "progressive_disclosure": "Footer shows 3-5 critical keys always. `?` shows full keybinding overlay on demand. Documentation handles the power-user ceiling. Users should never need to read a manual to get started.",
+      "semantic_color": "Define colors by function (status.success, status.error, accent.primary) not appearance. Enables overnight theme-swapping. The three-tier model: design first for 16 ANSI colors, then 256, then true color. Strip all color when $NO_COLOR is set.",
+      "spatial_consistency": "Panels don't move. The user's spatial memory is their navigation. Every layout reshuffle resets mental maps to zero.",
+      "resize_guard": "Minimum 80x24 guard with a clear human-readable message. Handle terminal resize events so layout reflows gracefully rather than rendering stale geometry.",
+      "async_ui": "Never freeze the UI. Every background operation must have a visible progress indicator. User must always be able to reach Esc/q and get a responsive interface.",
+      "vim_keybinding_layers": {
+        "L0_universal": "Arrow keys, Enter, Escape, q to quit — always shown in footer",
+        "L1_vim": "j/k/h/l, /, ?, g/G — shown in footer for terminal natives",
+        "L2_actions": "Mnemonic single keys (s=save, r=refresh) — discoverable through ? overlay",
+        "L3_power": "Composed commands, macros — documentation only"
+      },
+      "information_density": "Every cell earns its place. Use fractional block chars (▏▎▍▌▋▊▉█) and braille overlays for sub-cell precision in charts. Status indicators use semantic symbols: ● online, ○ offline, ◐ transitioning.",
+      "reactive_over_polling": "Prefer reactive push (tokio::watch, broadcast) over timer polling for data freshness — the codebase already uses this pattern correctly.",
+      "layout_patterns": "For a speed-test monitor dashboard, 'Widget Dashboard' or 'Header + Scrollable List' is the closest match. Spatial consistency means the latency panel is always in the same position."
+    },
+    "applied_to_speedt": {
+      "layout_classification": "Header + Scrollable List with a pinned footer — already close to the right pattern.",
+      "primary_missing_ux_surface": "? help overlay with progressive disclosure.",
+      "biggest_information_gap": "Jitter missing from TUI latency panel (present in plain renderer) and no latency trend sparkline.",
+      "color_architecture_priority": "Extract semantic color constants before adding more color-dependent features to avoid a hex-code sprawl problem.",
+      "resize_handling_urgency": "High — narrow terminals silently garble the layout today."
+    }
+  },
+  "improvements": [
+    {
+      "id": "A1",
+      "category": "stability",
+      "title": "Minimum terminal size guard + resize handling",
+      "priority": "high",
+      "description": "Check terminal dimensions on every render tick. When width < 80 or height < 24, replace the full layout with a single centered message ('Terminal too small — resize to at least 80×24'). Handle crossterm Event::Resize by triggering an immediate redraw so the layout reflows rather than showing stale geometry.",
+      "files": ["src/ui/tui.rs"],
+      "effort": "small",
+      "rationale": "Prevents garbled renders on narrow windows; resize is an L0 stability concern."
+    },
+    {
+      "id": "A2",
+      "category": "stability",
+      "title": "Error ring buffer (replace single last_error slot)",
+      "priority": "medium",
+      "description": "Replace `last_error: Option<String>` in State with `errors: VecDeque<String>` capped at 3. Render all accumulated errors in the footer (scrolling if needed). Second error no longer silently replaces the first.",
+      "files": ["src/ui/tui.rs"],
+      "effort": "small",
+      "rationale": "A second network error during a session currently overwrites the first, hiding failure history."
+    },
+    {
+      "id": "A3",
+      "category": "stability",
+      "title": "Enable `s` save in results view + footer hint parity",
+      "priority": "medium",
+      "description": "In the results view branch of run_loop, add the KeyAction::Save handler and show the `s  save report` span in the footer. Currently save is hidden from the user once the session finishes, even though build_partial_report + save work fine at that point.",
+      "files": ["src/ui/tui.rs"],
+      "effort": "small",
+      "rationale": "Users who want to save after reviewing results currently have no affordance for it."
+    },
+    {
+      "id": "B1",
+      "category": "visual_consistency",
+      "title": "Semantic color constants module",
+      "priority": "high",
+      "description": "Create a `theme` module (or submodule of ui) with named Style constants: STYLE_DOWNLOAD, STYLE_UPLOAD, STYLE_SUCCESS, STYLE_WARN, STYLE_ERROR, STYLE_MUTED, STYLE_EMPHASIS, STYLE_KEY_HINT. Replace all inline color literals in tui.rs with these constants. Also add a `no_color()` fn that returns Style::default() when $NO_COLOR is set, and thread it through all styled spans.",
+      "files": ["src/ui/tui.rs", "src/ui/theme.rs (new)"],
+      "effort": "medium",
+      "rationale": "23 inline color literals today. Without a semantic layer, adding theming or $NO_COLOR support later requires grepping 50 call sites. Semantic constants enable overnight theme swaps."
+    },
+    {
+      "id": "B2",
+      "category": "visual_consistency",
+      "title": "$NO_COLOR / color-tier detection",
+      "priority": "medium",
+      "description": "At TUI startup, check std::env::var('NO_COLOR'). If set, use Style::default() everywhere (monochrome mode). Optionally check $COLORTERM for 'truecolor'/'24bit' to enable Rgb() color slots; fall back to named ANSI colors otherwise. This makes the app work cleanly over SSH on 16-color connections.",
+      "files": ["src/ui/theme.rs", "src/ui/tui.rs"],
+      "effort": "small",
+      "depends_on": ["B1"],
+      "rationale": "Professional courtesy; also required for accessibility and CI environments."
+    },
+    {
+      "id": "B3",
+      "category": "visual_consistency",
+      "title": "Latency RTT sparkline in latency panel",
+      "priority": "medium",
+      "description": "Add a small (1-row) sparkline widget below the latency table showing idle RTT trend across the session. Buffer idle_rtts_us already accumulates samples; derive a sparkline from the last min(width, N) samples. This gives a visual trend that numbers alone don't convey (e.g. a spike mid-session).",
+      "files": ["src/ui/tui.rs"],
+      "effort": "small",
+      "rationale": "The throughput panel has a sparkline; the latency panel has only a static table. Adding RTT trend closes the visual parity gap."
+    },
+    {
+      "id": "B4",
+      "category": "visual_consistency",
+      "title": "Sparkline scale annotation",
+      "priority": "low",
+      "description": "Add a one-character right-margin annotation to the throughput sparkline showing the current max value in the visible window (e.g. '↑ 482 Mbps'). Renders as a styled Span to the right of the sparkline block. Prevents the sparkline from being uninterpretable when scale shifts dramatically.",
+      "files": ["src/ui/tui.rs"],
+      "effort": "small",
+      "rationale": "A sparkline without a scale is decoration, not information."
+    },
+    {
+      "id": "C1",
+      "category": "helpfulness",
+      "title": "? help overlay",
+      "priority": "high",
+      "description": "Add a `help_visible: bool` field to State. Pressing `?` toggles it. When true, draw a centered popup over the current layout listing all keybindings in two columns (key | description). Include: q=quit, s=save, ?=toggle help, Ctrl-C=interrupt. Dismiss with `?`, `q`, or Escape.",
+      "files": ["src/ui/tui.rs"],
+      "effort": "medium",
+      "rationale": "Progressive disclosure is the #1 missing UX surface. Without ?, keybinding discoverability relies entirely on a 3-char footer label."
+    },
+    {
+      "id": "C2",
+      "category": "helpfulness",
+      "title": "? hint in footer",
+      "priority": "medium",
+      "description": "Add `·  ?  help` to the footer spans (between `s save report` and the save flash). Makes the help overlay discoverable at a glance. The key hint uses the same STYLE_KEY_HINT as `q` and `s`.",
+      "files": ["src/ui/tui.rs"],
+      "depends_on": ["C1"],
+      "effort": "tiny",
+      "rationale": "A help overlay that nobody knows exists provides zero value."
+    },
+    {
+      "id": "C3",
+      "category": "helpfulness",
+      "title": "Overall session progress % in header",
+      "priority": "medium",
+      "description": "In draw_header, add an overall progress ratio (elapsed / total_planned_secs) formatted as a percentage alongside the clock. Optionally add a thin overall progress bar to the header block. During results view, show '100%  complete' instead.",
+      "files": ["src/ui/tui.rs"],
+      "effort": "small",
+      "rationale": "Users running `speedt deep` (5-min session) want a quick glance at how far along they are without doing mental math on the clock display."
+    },
+    {
+      "id": "C4",
+      "category": "helpfulness",
+      "title": "Jitter column in TUI latency panel",
+      "priority": "high",
+      "description": "Add a 'jitter' column (stdev_ms from LatencySummary) to the TUI latency table. The plain renderer already shows this; the TUI currently omits it — a regression in information density. Adjust column widths via Constraint::Min / Constraint::Length to fit.",
+      "files": ["src/ui/tui.rs"],
+      "effort": "small",
+      "rationale": "Jitter is a primary network quality signal. Omitting it from the TUI while showing it in plain mode creates a confusing information gap."
+    },
+    {
+      "id": "C5",
+      "category": "helpfulness",
+      "title": "Latency probe count progress in latency panel",
+      "priority": "low",
+      "description": "Replace the bare count column ('n') with a fraction showing collected vs planned probes (e.g. '42/60') for idle latency. Requires plumbing total probe count through UiEvent::SessionStarted or a new dedicated event.",
+      "files": ["src/ui/tui.rs", "src/ui/mod.rs", "src/session.rs"],
+      "effort": "medium",
+      "rationale": "Context for how much data backs the current latency estimate makes results more trustworthy during the run."
+    }
+  ],
+  "dag_plan": {
+    "note": "See flowd plan created from this file. Steps mirror the improvement IDs above.",
+    "parallel_groups": [
+      {"group": 1, "ids": ["A1", "A2", "A3", "B1", "B3", "B4", "C1", "C3", "C4"], "note": "All independent; can run in parallel"},
+      {"group": 2, "ids": ["B2", "C2"], "note": "B2 depends on B1; C2 depends on C1"},
+      {"group": 3, "ids": ["verify"], "note": "cargo check + nextest after all edits land"}
+    ]
+  }
+}
