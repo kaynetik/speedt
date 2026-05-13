@@ -13,14 +13,15 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Sparkline, Table};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
 use tokio::time;
 
+use super::theme;
 use super::{PhaseKind, ProbeKind, UiEvent, UiEventRx};
 use crate::metadata::Metadata;
 use crate::report::{
@@ -35,6 +36,8 @@ const SAMPLE_BUFFER_CAP: usize = 240;
 const RENDER_INTERVAL: Duration = Duration::from_millis(33);
 /// How long the "saved to …" footer flash stays visible after pressing `s`.
 const SAVE_FLASH: Duration = Duration::from_secs(4);
+/// Maximum number of recent error messages retained for the footer.
+const MAX_ERRORS: usize = 3;
 
 /// Install a process-wide panic hook that restores the terminal (cooked mode,
 /// main screen, visible cursor) before delegating to the previously-installed
@@ -123,8 +126,12 @@ async fn run_loop(
                             let result = save_report(&state);
                             state.last_save = Some(SaveStatus { at: Instant::now(), result });
                         }
+                        Some(KeyAction::Help) => state.help_visible = !state.help_visible,
                         None => {}
                     },
+                    Some(Ok(Event::Resize(_, _))) => {
+                        terminal.autoresize()?;
+                    }
                     Some(Ok(_) | Err(_)) => {}
                     None => break,
                 },
@@ -162,8 +169,12 @@ async fn run_loop(
                             let result = save_report(&state);
                             state.last_save = Some(SaveStatus { at: Instant::now(), result });
                         }
+                        Some(KeyAction::Help) => state.help_visible = !state.help_visible,
                         None => {}
                     },
+                    Some(Ok(Event::Resize(_, _))) => {
+                        terminal.autoresize()?;
+                    }
                     Some(Ok(_) | Err(_)) => {}
                     None => break,
                 },
@@ -180,12 +191,14 @@ async fn run_loop(
 enum KeyAction {
     Quit,
     Save,
+    Help,
 }
 
 fn key_action(k: KeyEvent) -> Option<KeyAction> {
     match k.code {
         KeyCode::Char('q') => Some(KeyAction::Quit),
         KeyCode::Char('s') => Some(KeyAction::Save),
+        KeyCode::Char('?') => Some(KeyAction::Help),
         _ => None,
     }
 }
@@ -207,7 +220,7 @@ struct State {
     loaded_dl_rtts_us: Vec<u64>,
     loaded_ul_rtts_us: Vec<u64>,
 
-    last_error: Option<String>,
+    errors: VecDeque<String>,
     last_save: Option<SaveStatus>,
 
     /// Final report received via `SessionFinished`. Its presence flips the
@@ -217,6 +230,8 @@ struct State {
     /// Frozen elapsed time at the moment `SessionFinished` arrived, so the
     /// header clock stops advancing once the session is done.
     final_elapsed_secs: Option<f64>,
+
+    help_visible: bool,
 }
 
 struct SaveStatus {
@@ -296,7 +311,12 @@ impl State {
                 self.final_elapsed_secs = Some(self.session_elapsed_secs());
                 self.final_report = Some(rep);
             }
-            UiEvent::Error(e) => self.last_error = Some(e),
+            UiEvent::Error(e) => {
+                if self.errors.len() == MAX_ERRORS {
+                    self.errors.pop_back();
+                }
+                self.errors.push_front(e);
+            }
         }
     }
 
@@ -311,13 +331,19 @@ impl State {
 }
 
 fn draw(f: &mut ratatui::Frame, state: &State) {
+    let area = f.area();
+    if area.width < 80 || area.height < 24 {
+        draw_too_small(f, area);
+        return;
+    }
+
     // Results view adds a one-line summary card under the latency table.
     let summary_height: u16 = if state.final_report.is_some() { 3 } else { 0 };
 
     let mut constraints: Vec<Constraint> = vec![
         Constraint::Length(4), // Header
         Constraint::Min(0),    // Phase area (elastic)
-        Constraint::Length(5), // Latency
+        Constraint::Length(7), // Latency (expanded: table + RTT sparkline row)
     ];
     if summary_height > 0 {
         constraints.push(Constraint::Length(summary_height));
@@ -327,7 +353,7 @@ fn draw(f: &mut ratatui::Frame, state: &State) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .split(f.area());
+        .split(area);
 
     draw_header(f, chunks[0], state);
     draw_phase_area(f, chunks[1], state);
@@ -338,19 +364,85 @@ fn draw(f: &mut ratatui::Frame, state: &State) {
     } else {
         draw_footer(f, chunks[3], state);
     }
+
+    if state.help_visible {
+        draw_help_overlay(f, area);
+    }
+}
+
+fn draw_too_small(f: &mut ratatui::Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let para = Paragraph::new("Terminal too small \u{2014} resize to at least 80\u{00d7}24")
+        .style(Style::default().fg(Color::Yellow))
+        .alignment(Alignment::Center);
+    f.render_widget(para, rows[1]);
+}
+
+fn draw_help_overlay(f: &mut ratatui::Frame, area: Rect) {
+    let popup = centered_help_rect(area);
+    f.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("q       ", theme::key_hint_style()),
+            Span::raw("quit"),
+        ]),
+        Line::from(vec![
+            Span::styled("s       ", theme::key_hint_style()),
+            Span::raw("save report"),
+        ]),
+        Line::from(vec![
+            Span::styled("?       ", theme::key_hint_style()),
+            Span::raw("toggle this help"),
+        ]),
+        Line::from(vec![
+            Span::styled("Ctrl-C  ", theme::key_hint_style()),
+            Span::raw("interrupt"),
+        ]),
+    ];
+    let para = Paragraph::new(lines).block(
+        Block::default().borders(Borders::ALL).title(Span::styled(
+            " help ",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+    );
+    f.render_widget(para, popup);
+}
+
+fn centered_help_rect(area: Rect) -> Rect {
+    let width = (area.width.saturating_mul(60) / 100).clamp(20, area.width);
+    let height = (area.height.saturating_mul(80) / 100).clamp(6, area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect { x, y, width, height }
 }
 
 fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &State) {
     let mode = state.mode.unwrap_or("…");
     let elapsed = state.session_elapsed_secs();
     let total = state.total_planned_secs;
-    let title_line = Line::from(vec![
+    let overall_pct = (elapsed / total.max(0.001) * 100.0).clamp(0.0, 100.0) as u8;
+    let mut title_line = Line::from(vec![
         Span::styled("speedt", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  ·  "),
-        Span::styled(mode, Style::default().fg(Color::Cyan)),
+        Span::styled(mode, theme::download_style()),
         Span::raw("  ·  "),
         Span::raw(format!("{} / {}", fmt_clock(elapsed), fmt_clock(total))),
     ]);
+    if state.final_report.is_some() {
+        title_line.spans.push(Span::styled("  done", theme::muted_style()));
+    } else {
+        title_line
+            .spans
+            .push(Span::styled(format!("  {overall_pct}%"), theme::muted_style()));
+    }
     let meta_line = Line::from(metadata_segments(state.metadata.as_deref()));
 
     let para = Paragraph::new(vec![title_line, meta_line])
@@ -360,10 +452,7 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &State) {
 
 fn metadata_segments(md: Option<&Metadata>) -> Vec<Span<'static>> {
     let Some(md) = md else {
-        return vec![Span::styled(
-            "(metadata pending…)",
-            Style::default().fg(Color::DarkGray),
-        )];
+        return vec![Span::styled("(metadata pending…)", theme::muted_style())];
     };
 
     let mut parts: Vec<String> = Vec::new();
@@ -385,15 +474,12 @@ fn metadata_segments(md: Option<&Metadata>) -> Vec<Span<'static>> {
         parts.push(tls.clone());
     }
     if parts.is_empty() {
-        return vec![Span::styled(
-            "(metadata unavailable)",
-            Style::default().fg(Color::DarkGray),
-        )];
+        return vec![Span::styled("(metadata unavailable)", theme::muted_style())];
     }
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(parts.len() * 2);
     for (i, p) in parts.into_iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled("  ·  ", theme::muted_style()));
         }
         spans.push(Span::raw(p));
     }
@@ -454,7 +540,7 @@ fn draw_phase_area(f: &mut ratatui::Frame, area: Rect, state: &State) {
             draw_active_phase(f, rows[idx], active);
         }
     } else if state.finished.is_empty() {
-        let para = Paragraph::new(if let Some(err) = &state.last_error {
+        let para = Paragraph::new(if let Some(err) = state.errors.front() {
             format!("error: {err}")
         } else {
             "waiting for first phase…".to_string()
@@ -480,13 +566,11 @@ fn draw_finished_card(f: &mut ratatui::Frame, area: Rect, rep: &PhaseReport) {
         rep.duration_secs,
     );
     let para = Paragraph::new(vec![Line::from(line1), Line::from(line2)])
-        .style(Style::default().fg(Color::DarkGray))
+        .style(theme::muted_style())
         .block(
             Block::default().borders(Borders::ALL).title(Span::styled(
                 title,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                theme::success_style().add_modifier(Modifier::BOLD),
             )),
         );
     f.render_widget(para, area);
@@ -494,14 +578,13 @@ fn draw_finished_card(f: &mut ratatui::Frame, area: Rect, rep: &PhaseReport) {
 
 fn draw_active_phase(f: &mut ratatui::Frame, area: Rect, active: &ActivePhase) {
     let title = format!(" {} (live) ", active.label);
+    let phase_style = match active.kind {
+        PhaseKind::Download => theme::download_style(),
+        PhaseKind::Upload => theme::upload_style(),
+    };
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         title,
-        Style::default()
-            .fg(match active.kind {
-                PhaseKind::Download => Color::Cyan,
-                PhaseKind::Upload => Color::Magenta,
-            })
-            .add_modifier(Modifier::BOLD),
+        phase_style.add_modifier(Modifier::BOLD),
     ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -514,7 +597,7 @@ fn draw_active_phase(f: &mut ratatui::Frame, area: Rect, active: &ActivePhase) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // Gauge
-            Constraint::Min(1),    // Sparkline
+            Constraint::Min(1),    // Sparkline + scale
             Constraint::Length(1), // Stats line
         ])
         .split(inner);
@@ -523,7 +606,7 @@ fn draw_active_phase(f: &mut ratatui::Frame, area: Rect, active: &ActivePhase) {
     let planned = active.planned_secs.max(0.001);
     let ratio = (elapsed / planned).clamp(0.0, 1.0);
     let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
+        .gauge_style(theme::success_style().bg(Color::Black))
         .ratio(ratio)
         .label(format!(
             "{} / {}  ({:.0}%)",
@@ -538,13 +621,26 @@ fn draw_active_phase(f: &mut ratatui::Frame, area: Rect, active: &ActivePhase) {
         .iter()
         .map(|s| (s.mbps.max(0.0) * 100.0) as u64)
         .collect();
+    let max_mbps = active
+        .samples
+        .iter()
+        .map(|s| s.mbps)
+        .fold(0.0_f64, f64::max);
+    let spark_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(14)])
+        .split(chunks[1]);
     let sparkline = Sparkline::default()
         .data(&spark_data)
-        .style(Style::default().fg(match active.kind {
-            PhaseKind::Download => Color::Cyan,
-            PhaseKind::Upload => Color::Magenta,
-        }));
-    f.render_widget(sparkline, chunks[1]);
+        .style(match active.kind {
+            PhaseKind::Download => theme::download_style(),
+            PhaseKind::Upload => theme::upload_style(),
+        });
+    f.render_widget(sparkline, spark_cols[0]);
+    let scale = Paragraph::new(format!("\u{2191}{:>6.1} Mbps", max_mbps))
+        .style(theme::muted_style())
+        .alignment(Alignment::Right);
+    f.render_widget(scale, spark_cols[1]);
 
     let mbps: Vec<f64> = active.samples.iter().map(|s| s.mbps).collect();
     let p50 = percentile(&mbps, 50.0);
@@ -595,15 +691,17 @@ fn draw_expanded_phase(f: &mut ratatui::Frame, area: Rect, rep: &PhaseReport) {
     let para = Paragraph::new(lines).block(
         Block::default().borders(Borders::ALL).title(Span::styled(
             title,
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            theme::success_style().add_modifier(Modifier::BOLD),
         )),
     );
     f.render_widget(para, area);
 }
 
 fn draw_latency(f: &mut ratatui::Frame, area: Rect, state: &State) {
+    let block = Block::default().borders(Borders::ALL).title(" latency ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
     let idle_p50 = u64_p50_ms(&state.idle_rtts_us);
     let loaded_dl_p50 = u64_p50_ms(&state.loaded_dl_rtts_us);
     let loaded_ul_p50 = u64_p50_ms(&state.loaded_ul_rtts_us);
@@ -617,6 +715,7 @@ fn draw_latency(f: &mut ratatui::Frame, area: Rect, state: &State) {
             Cell::from(fmt_count(state.idle_rtts_us.len())),
             Cell::from(fmt_opt_ms(idle_p50)),
             Cell::from(fmt_opt_ms(u64_pct_ms(&state.idle_rtts_us, 95.0))),
+            Cell::from(fmt_opt_ms(u64_stdev_ms(&state.idle_rtts_us))),
             Cell::from(""),
         ]),
         Row::new(vec![
@@ -624,6 +723,7 @@ fn draw_latency(f: &mut ratatui::Frame, area: Rect, state: &State) {
             Cell::from(fmt_count(state.loaded_dl_rtts_us.len())),
             Cell::from(fmt_opt_ms(loaded_dl_p50)),
             Cell::from(fmt_opt_ms(u64_pct_ms(&state.loaded_dl_rtts_us, 95.0))),
+            Cell::from(fmt_opt_ms(u64_stdev_ms(&state.loaded_dl_rtts_us))),
             grade_cell(bb_dl),
         ]),
         Row::new(vec![
@@ -631,6 +731,7 @@ fn draw_latency(f: &mut ratatui::Frame, area: Rect, state: &State) {
             Cell::from(fmt_count(state.loaded_ul_rtts_us.len())),
             Cell::from(fmt_opt_ms(loaded_ul_p50)),
             Cell::from(fmt_opt_ms(u64_pct_ms(&state.loaded_ul_rtts_us, 95.0))),
+            Cell::from(fmt_opt_ms(u64_stdev_ms(&state.loaded_ul_rtts_us))),
             grade_cell(bb_ul),
         ]),
     ];
@@ -640,22 +741,51 @@ fn draw_latency(f: &mut ratatui::Frame, area: Rect, state: &State) {
         Constraint::Length(6),
         Constraint::Length(12),
         Constraint::Length(12),
+        Constraint::Length(12),
         Constraint::Min(20),
     ];
-    let table = Table::new(rows, widths)
-        .header(
-            Row::new(vec!["", "n", "p50", "p95", "bufferbloat"])
-                .style(Style::default().fg(Color::DarkGray)),
-        )
-        .block(Block::default().borders(Borders::ALL).title(" latency "));
-    f.render_widget(table, area);
+
+    let has_sparkline = state.idle_rtts_us.len() >= 2;
+    let chunks = if has_sparkline {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Length(1)])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0)])
+            .split(inner)
+    };
+
+    let table = Table::new(rows, widths).header(
+        Row::new(vec!["", "n", "p50", "p95", "jitter", "bufferbloat"])
+            .style(theme::muted_style()),
+    );
+    f.render_widget(table, chunks[0]);
+
+    if has_sparkline && chunks.len() > 1 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(16), Constraint::Min(1)])
+            .split(chunks[1]);
+
+        let label = Paragraph::new("idle RTT trend").style(theme::muted_style());
+        f.render_widget(label, cols[0]);
+
+        let max_samples = (area.width as usize).min(120);
+        let start = state.idle_rtts_us.len().saturating_sub(max_samples);
+        let data: Vec<u64> = state.idle_rtts_us[start..].to_vec();
+        let sparkline = Sparkline::default().data(&data).style(theme::muted_style());
+        f.render_widget(sparkline, cols[1]);
+    }
 }
 
 fn grade_cell(bb: Option<BufferbloatGrade>) -> Cell<'static> {
     let Some(bb) = bb else {
         return Cell::from("");
     };
-    let mut style = Style::default().fg(grade_color(bb.grade));
+    let mut style = theme::grade_style(bb.grade);
     if bb.grade == 'F' {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -664,17 +794,6 @@ fn grade_cell(bb: Option<BufferbloatGrade>) -> Cell<'static> {
         bb.added_latency_ms, bb.grade
     ))
     .style(style)
-}
-
-fn grade_color(grade: char) -> Color {
-    match grade {
-        'A' => Color::Green,
-        'B' => Color::Yellow,
-        // No DarkYellow in ratatui::Color — pick a recognizable dark gold.
-        'C' => Color::Rgb(184, 134, 11),
-        'D' | 'F' => Color::Red,
-        _ => Color::Gray,
-    }
 }
 
 fn bufferbloat(idle_p50: Option<f64>, loaded_p50: Option<f64>) -> Option<BufferbloatGrade> {
@@ -704,37 +823,28 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, state: &State) {
         " quit"
     };
     let mut spans: Vec<Span<'static>> = Vec::new();
-    if let Some(err) = &state.last_error {
+    if !state.errors.is_empty() {
         spans.push(Span::styled(
             "error: ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            theme::error_style().add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::raw(err.clone()));
+        let joined = state
+            .errors
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        spans.push(Span::raw(joined));
         spans.push(Span::raw("    "));
     }
-    spans.push(Span::styled(
-        "q",
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(
-        quit_suffix,
-        Style::default().fg(Color::DarkGray),
-    ));
-    if !in_results {
-        spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(
-            "s",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            " save report",
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
+    spans.push(Span::styled("q", theme::key_hint_style()));
+    spans.push(Span::styled(quit_suffix, theme::muted_style()));
+    spans.push(Span::styled("  ·  ", theme::muted_style()));
+    spans.push(Span::styled("s", theme::key_hint_style()));
+    spans.push(Span::styled(" save report", theme::muted_style()));
+    spans.push(Span::styled("  ·  ", theme::muted_style()));
+    spans.push(Span::styled("?", theme::key_hint_style()));
+    spans.push(Span::styled(" help", theme::muted_style()));
     if let Some(flash) = save_flash_span(state) {
         spans.push(Span::raw("    "));
         spans.push(flash);
@@ -750,13 +860,10 @@ fn save_flash_span(state: &State) -> Option<Span<'static>> {
     }
     Some(match &s.result {
         Ok(path) => Span::styled(
-            format!("saved → {}", path.display()),
-            Style::default().fg(Color::Green),
+            format!("saved \u{2192} {}", path.display()),
+            theme::success_style(),
         ),
-        Err(msg) => Span::styled(
-            format!("save failed: {msg}"),
-            Style::default().fg(Color::Red),
-        ),
+        Err(msg) => Span::styled(format!("save failed: {msg}"), theme::error_style()),
     })
 }
 
@@ -866,6 +973,23 @@ fn fmt_bytes(b: u64) -> String {
 
 fn u64_p50_ms(samples: &[u64]) -> Option<f64> {
     u64_pct_ms(samples, 50.0)
+}
+
+fn u64_stdev_ms(samples: &[u64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let n = samples.len() as f64;
+    let mean_ms: f64 = samples.iter().map(|&v| v as f64 / 1_000.0).sum::<f64>() / n;
+    let variance: f64 = samples
+        .iter()
+        .map(|&v| {
+            let d = v as f64 / 1_000.0 - mean_ms;
+            d * d
+        })
+        .sum::<f64>()
+        / n;
+    Some(variance.sqrt())
 }
 
 fn u64_pct_ms(samples: &[u64], pct: f64) -> Option<f64> {
@@ -1024,5 +1148,17 @@ mod tests {
         for win in mbps.windows(2) {
             assert!(win[1] > win[0], "sparkline order must be insertion order");
         }
+    }
+
+    #[test]
+    fn u64_stdev_ms_is_zero_for_uniform_samples() {
+        let samples = vec![5_000u64; 10]; // all 5 ms
+        let stdev = u64_stdev_ms(&samples).unwrap();
+        assert!(stdev.abs() < 1e-9, "stdev of uniform samples must be 0, got {stdev}");
+    }
+
+    #[test]
+    fn u64_stdev_ms_returns_none_for_empty() {
+        assert!(u64_stdev_ms(&[]).is_none());
     }
 }

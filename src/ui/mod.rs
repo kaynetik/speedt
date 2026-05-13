@@ -2,6 +2,7 @@ use crate::metadata::Metadata;
 use crate::report::{PhaseReport, SessionReport};
 use crate::sampler::Sample;
 
+pub mod theme;
 pub mod tui;
 
 /// Which throughput phase a [`UiEvent`] refers to.
